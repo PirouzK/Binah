@@ -1,0 +1,21 @@
+# Core plotting & numerics
+matplotlib>=3.7
+numpy>=1.24
+scipy>=1.10
+
+# XAS analysis (pre-edge normalisation, XAFS)
+xraylarch>=0.9.80
+
+# Athena .prj file support & HDF5
+h5py>=3.8
+
+# XAS panel visualisation
+seaborn>=0.12
+
+# SGM beamline data loader (Canadian Light Source)
+# Install manually if needed:
+#   pip install git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git
+sgmanalysis @ git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git
+
+# Image export (used internally by matplotlib)
+pillow>=9.0
