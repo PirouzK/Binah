@@ -629,8 +629,16 @@ class XASAnalysisTab(tk.Frame):
                      values=["paper", "notebook", "talk", "poster"]
                      ).pack(side=tk.LEFT)
 
-        # ── Show on XANES plot (Athena-style) ─────────────────────────────────
-        lbl("── Show on XANES plot ───────")
+        # ── Show on XANES plot (Athena-style) — hidden when >1 scan shown ────
+        self._show_section_frame = tk.Frame(pf)
+        self._show_section_frame.pack(fill=tk.X)
+
+        def _slbl(text):
+            tk.Label(self._show_section_frame, text=text,
+                     font=("", 8, "bold"), fg="#333333",
+                     anchor="w").pack(fill=tk.X, pady=(6, 0))
+
+        _slbl("── Show on XANES plot ───────")
         self._show_raw_var      = tk.BooleanVar(value=True)
         self._show_preline_var  = tk.BooleanVar(value=True)
         self._show_postline_var = tk.BooleanVar(value=True)
@@ -647,13 +655,120 @@ class XASAnalysisTab(tk.Frame):
             ("Normalized \u03bc(E)",   self._show_norm_var),
             ("Derivative d\u03bc/dE",  self._show_deriv_var),
         ]:
-            tk.Checkbutton(pf, text=_txt, variable=_var,
+            tk.Checkbutton(self._show_section_frame, text=_txt, variable=_var,
                            command=self._redraw_xanes,
                            font=("", 8)).pack(anchor="w", pady=1)
 
         tk.Checkbutton(pf, text="Show FT window on \u03c7(k)",
                        variable=self._show_win_var,
                        font=("", 8)).pack(anchor="w", pady=1)
+
+    def _update_show_section_visibility(self):
+        """Show 'Show on XANES plot' section only when exactly 1 scan is visible."""
+        n_visible = len(self._selected_labels)
+        if n_visible <= 1:
+            self._show_section_frame.pack(fill=tk.X)
+        else:
+            self._show_section_frame.pack_forget()
+
+    def auto_run_all(self):
+        """Run analysis on every loaded scan and show them all. Called when tab is opened."""
+        scans = self._get_scans()
+        if not scans:
+            return
+        self._rebuild_scan_list_rows()
+        for label, scan, *_ in scans:
+            if label not in self._scan_vis_vars:
+                self._scan_vis_vars[label] = tk.BooleanVar(value=True)
+            self._scan_vis_vars[label].set(True)
+            # Run analysis only if not already cached
+            if label not in self._results:
+                self._scan_var.set(label)
+                self._auto_fill_e0()
+                self._run_single(label, scan)
+            if label not in self._selected_labels:
+                self._selected_labels.append(label)
+        self._rebuild_scan_list_rows()
+        self._redraw()
+
+    def _run_single(self, label: str, scan):
+        """Run analysis pipeline on one scan without touching the overlay/redraw."""
+        e0   = self._e0_var.get()
+        pre1 = self._pre1_var.get()
+        pre2 = self._pre2_var.get()
+        nor1 = self._nor1_var.get()
+        nor2 = self._nor2_var.get()
+        nnor = self._nnor_var.get()
+        rbkg = self._rbkg_var.get()
+        kmin_bkg = self._kmin_bkg_var.get()
+        kmin = self._kmin_var.get()
+        kmax = self._kmax_var.get()
+        dk   = self._dk_var.get()
+        kw   = self._kw_var.get()
+
+        # Use stored e0 if valid
+        if scan.e0 and scan.e0 > 100:
+            e0 = scan.e0
+
+        energy = scan.energy_ev.copy()
+        mu_raw = scan.mu.copy()
+
+        try:
+            if _HAS_LARCH:
+                session = _get_larch_session()
+                grp = LarchGroup(energy=energy, mu=mu_raw)
+                _larch_pre_edge(grp, _larch=session,
+                                e0=float(e0) if e0 > 100 else None,
+                                pre1=float(pre1), pre2=float(pre2),
+                                norm1=float(nor1), norm2=float(nor2),
+                                nnorm=int(nnor))
+                _larch_autobk(grp, _larch=session,
+                               rbkg=float(rbkg), kmin=float(kmin_bkg))
+                _larch_xftf(grp, _larch=session,
+                             kmin=float(kmin), kmax=float(kmax),
+                             dk=float(dk), kweight=int(kw))
+                self._results[label] = {
+                    "energy":    grp.energy,
+                    "mu_norm":   getattr(grp, "flat", grp.norm),
+                    "bkg_e":     grp.bkg,
+                    "k":         grp.k,
+                    "chi":       grp.chi,
+                    "r":         grp.r,
+                    "chi_r":     grp.chir_mag,
+                    "chi_r_re":  grp.chir_re,
+                    "chi_r_im":  grp.chir_im,
+                    "e0":        float(grp.e0),
+                    "edge_step": float(grp.edge_step),
+                    "kw":        kw,
+                    "mu_raw":    mu_raw,
+                    "pre_line":  getattr(grp, "pre_edge", np.zeros_like(energy)),
+                }
+                # Push back to scan
+                scan.mu = getattr(grp, "flat", grp.norm).copy()
+                scan.e0 = float(grp.e0)
+                scan.is_normalized = True
+            else:
+                mu_norm, edge_step, pre_line = normalize_xanes(
+                    energy, mu_raw, e0, pre1, pre2, nor1, nor2, nnor)
+                k_arr, chi, bkg_e = autobk(energy, mu_norm, e0, rbkg, kmin_bkg)
+                r_arr, chi_r, chi_r_re, chi_r_im = (
+                    xftf(k_arr, chi, kmin, kmax, dk, kw)
+                    if len(k_arr) >= 4
+                    else (np.array([0.0]), np.array([0.0]),
+                          np.array([0.0]), np.array([0.0])))
+                self._results[label] = {
+                    "energy": energy, "mu_norm": mu_norm, "bkg_e": bkg_e,
+                    "k": k_arr, "chi": chi,
+                    "r": r_arr, "chi_r": chi_r,
+                    "chi_r_re": chi_r_re, "chi_r_im": chi_r_im,
+                    "e0": e0, "edge_step": edge_step, "kw": kw,
+                    "mu_raw": mu_raw, "pre_line": pre_line,
+                }
+                scan.mu = mu_norm.copy()
+                scan.e0 = e0
+                scan.is_normalized = True
+        except Exception:
+            pass   # silently skip failed scans in batch mode
 
     def _build_plot(self, parent):
         plot_area = tk.Frame(parent)
@@ -1171,14 +1286,13 @@ class XASAnalysisTab(tk.Frame):
             self._selected_labels.append(label)
 
         res = self._results[label]
-        self._redraw()
 
-        # ── Push normalized result back to scan → refreshes Spectra tab ──────
+        # ── Push normalized result back to scan object ────────────────────────
         scan.mu            = res["mu_norm"].copy()
         scan.e0            = res["e0"]
         scan.is_normalized = True
-        if self._replot_fn is not None:
-            self._replot_fn()
+
+        self._redraw()   # also calls replot_fn to refresh Spectra tab
 
         self._status_lbl.config(
             text=(f"[{engine}]  {label}  |  E\u2080={res['e0']:.1f} eV  |  "
@@ -1187,8 +1301,11 @@ class XASAnalysisTab(tk.Frame):
             fg="#003366" if engine == "larch" else "#664400")
 
     def _redraw(self):
+        self._update_show_section_visibility()
         self._redraw_xanes()
         self._redraw_exafs()
+        if self._replot_fn is not None:
+            self._replot_fn()
 
     def _redraw_xanes(self):
         if _HAS_SNS:

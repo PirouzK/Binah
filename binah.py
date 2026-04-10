@@ -185,6 +185,17 @@ class OrcaTDDFTApp(tk.Tk):
         )
         self._xas_tab.pack(fill=tk.BOTH, expand=True)
 
+        # Auto-run all scans when XAS Analysis tab is selected
+        def _on_tab_changed(event):
+            try:
+                selected = nb.tab(nb.select(), "text")
+                if "XAS" in selected:
+                    self._xas_tab.refresh_scan_list()
+                    self._xas_tab.auto_run_all()
+            except Exception:
+                pass
+        nb.bind("<<NotebookTabChanged>>", _on_tab_changed)
+
     # ------------------------------------------------------------------ #
     #  Status bar                                                           #
     # ------------------------------------------------------------------ #
