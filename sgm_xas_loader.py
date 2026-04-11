@@ -1311,7 +1311,10 @@ class SettingsPanel(ttk.LabelFrame):
     def _on_signal(self):
         # ROI controls only apply to PFY mode
         if self._signal_var.get() == 'PFY':
-            self._roi_frame.grid()
+            # Pass explicit grid options — safer than relying on grid() with no
+            # args, which can silently no-op on some tkinter/Tcl/Tk builds.
+            self._roi_frame.grid(row=2, column=0, columnspan=2,
+                                 sticky='we', padx=6, pady=3)
         else:
             self._roi_frame.grid_remove()
 
@@ -1601,30 +1604,50 @@ class ExportPanel(ttk.Frame):
 #  Main Application
 # ══════════════════════════════════════════════════════════════════════════════
 
-class SGMLoaderApp(tk.Tk):
+class SGMLoaderApp(tk.Toplevel):
     """Main window: SGM XAS Stack Loader.
+
+    Can be used standalone (pass no master) or embedded inside another Tk app
+    such as Binah (pass master=<parent_window>).
 
     Parameters
     ----------
+    master : tk.Tk or tk.Widget, optional
+        Parent window.  If None a hidden Tk root is created so the class can
+        run its own mainloop() — this is the standalone mode used by
+        ``if __name__ == "__main__"``.
     on_load_cb : callable, optional
-        If provided, a "Send to Binah" button appears in the Export tab.
+        If provided, a "→ Send to Binah" button appears in the Export tab.
         Called with an ExperimentalScan-like object for each exported spectrum.
         Signature: on_load_cb(scan) where scan has .label, .energy_ev, .mu,
         .source_file, .e0, .is_normalized, .scan_type attributes.
     """
 
-    def __init__(self, on_load_cb=None):
-        super().__init__()
+    def __init__(self, master=None, on_load_cb=None):
+        # ── Standalone mode: create a hidden Tk root to own the event loop ──
+        if master is None:
+            self._hidden_root = tk.Tk()
+            self._hidden_root.withdraw()
+            master = self._hidden_root
+        else:
+            self._hidden_root = None
+
+        super().__init__(master)
         self.title("SGM XAS Loader  —  Canadian Light Source")
         self.geometry("1280x760")
         self.resizable(True, True)
         self._on_load_cb = on_load_cb   # callback → Binah
 
+        # Bring window to front
+        self.lift()
+        self.focus_force()
+
         if not _H5PY:
             messagebox.showwarning(
                 "h5py not installed",
                 "h5py is required to read .h5 files.\n\n"
-                "Install with:  pip install h5py")
+                "Install with:  pip install h5py",
+                parent=self)
 
         self._spectra:  List[Spectrum]      = []
         self._averaged: Optional[Spectrum]  = None
@@ -1633,6 +1656,12 @@ class SGMLoaderApp(tk.Tk):
 
         self._build_menu()
         self._build_ui()
+
+    def mainloop(self):
+        """Run the event loop.  In standalone mode uses the hidden root."""
+        if self._hidden_root is not None:
+            self._hidden_root.mainloop()
+        # Embedded mode: caller uses wait_window() — nothing extra needed
 
     # ── Menu ───────────────────────────────────────────────────────────────
 
@@ -2005,6 +2034,15 @@ class SGMLoaderApp(tk.Tk):
                                 f"{n} spectrum/spectra added to Binah.\n"
                                 "Check the Spectra tab.",
                                 parent=self)
+
+    def destroy(self):
+        """Destroy this window and, in standalone mode, the hidden root."""
+        super().destroy()
+        if self._hidden_root is not None:
+            try:
+                self._hidden_root.destroy()
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════════════════════════════════════════

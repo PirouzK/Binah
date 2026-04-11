@@ -591,7 +591,7 @@ class OrcaTDDFTApp(tk.Tk):
         win.minsize(400, 200)
 
     def _load_sgm_stack(self):
-        """Open the SGM Stack Loader window."""
+        """Open the SGM Stack Loader as a child Toplevel window."""
         if not _HAS_SGM:
             messagebox.showerror(
                 "SGM Loader",
@@ -600,10 +600,11 @@ class OrcaTDDFTApp(tk.Tk):
                 "pip install git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git")
             return
         try:
-            # SGMLoaderApp is a tk.Tk — launch it as a separate top-level window.
-            # Pass the Binah callback so its "Send to Binah" button works.
-            app = _SGMLoaderApp(on_load_cb=self._add_exp_scan_to_plot)
-            app.mainloop()
+            # SGMLoaderApp is now a tk.Toplevel — pass self as master so it
+            # shares Binah's event loop.  wait_window() blocks until the user
+            # closes the SGM window, keeping Binah responsive throughout.
+            app = _SGMLoaderApp(master=self, on_load_cb=self._add_exp_scan_to_plot)
+            self.wait_window(app)
         except Exception as e:
             messagebox.showerror("SGM Error", f"Could not open SGM loader:\n{e}")
 
