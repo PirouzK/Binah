@@ -12,10 +12,9 @@ h5py>=3.8
 # XAS panel visualisation
 seaborn>=0.12
 
-# SGM beamline data loader (Canadian Light Source)
-# Install manually if needed:
-#   pip install git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git
-sgmanalysis @ git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git
+# Bundled sgmanalysis support
+scikit-learn>=1.3
+plotly>=5.0
 
 # Image export (used internally by matplotlib)
 pillow>=9.0

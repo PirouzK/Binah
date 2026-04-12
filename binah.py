@@ -596,8 +596,9 @@ class OrcaTDDFTApp(tk.Tk):
             messagebox.showerror(
                 "SGM Loader",
                 "SGM loader not available.\n\n"
-                "Install sgmanalysis:\n"
-                "pip install git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git")
+                "The bundled SGM loader could not be imported.\n"
+                "Check that the repository files are present and the dependencies\n"
+                "from requirements.txt are installed.")
             return
         try:
             # SGMLoaderApp is now a tk.Toplevel — pass self as master so it

@@ -46,7 +46,7 @@ pip install -r requirements.txt
 python binah.py
 ```
 
-> **Note:** The SGM beamline loader (`sgmanalysis`) is optional — the app will work without it if you do not need to load CLS SGM data files.
+> **Note:** This repository now bundles the `sgmanalysis` source used for CLS SGM data support, so you do not need a separate checkout of `SGMPython`.
 
 ---
 
@@ -102,6 +102,7 @@ xas_analysis_tab.py    — XAS pre-edge analysis panel
 project_manager.py     — Project save / load (.otproj)
 sgm_xas_loader.py      — CLS SGM beamline data loader
 ledge_normalizer.py    — L-edge normalisation utilities
+sgmanalysis/           — Bundled SGMPython analysis package
 ```
 
 ---
