@@ -54,8 +54,8 @@ except ImportError:
 #  Constants
 # ══════════════════════════════════════════════════════════════════════════════
 
-DEFAULT_DIR = (r"F:\OneDrive\OneDrive - University of Calgary"
-               r"\Science Work\XAS Data Collection\26-0311_SGM")
+# Default to the directory from which the program is launched.
+DEFAULT_DIR = os.path.abspath(os.getcwd())
 THIS_DIR    = os.path.dirname(os.path.abspath(__file__))
 NORMALIZER  = os.path.join(THIS_DIR, "ledge_normalizer.py")
 
@@ -125,6 +125,45 @@ def _parse_energy(dirname: str) -> Optional[float]:
     return None
 
 
+def _list_energy_subdirs(stack_path: str) -> List[Tuple[str, str, float]]:
+    """Return sorted ``(name, path, energy_eV)`` tuples for energy subdirs."""
+    subdirs: List[Tuple[str, str, float]] = []
+    try:
+        with os.scandir(stack_path) as it:
+            for entry in it:
+                if not entry.is_dir():
+                    continue
+                e_ev = _parse_energy(entry.name)
+                if e_ev is not None:
+                    subdirs.append((entry.name, entry.path, e_ev))
+    except OSError:
+        return []
+    subdirs.sort(key=lambda item: item[2])
+    return subdirs
+
+
+def _list_dir_files(dir_path: str) -> Dict[str, str]:
+    """Return a lowercase-name -> absolute-path map for files in ``dir_path``."""
+    files: Dict[str, str] = {}
+    try:
+        with os.scandir(dir_path) as it:
+            for entry in it:
+                if entry.is_file():
+                    files[entry.name.lower()] = entry.path
+    except OSError:
+        pass
+    return files
+
+
+def _first_file_with_suffix(files: Dict[str, str], suffix: str) -> Optional[str]:
+    """Return the first file path whose lowercase name ends with ``suffix``."""
+    suffix = suffix.lower()
+    for name, path in files.items():
+        if name.endswith(suffix):
+            return path
+    return None
+
+
 def _load_sdd_bin(path: str) -> Optional[np.ndarray]:
     """
     Load one SDD .bin file.
@@ -140,6 +179,23 @@ def _load_sdd_bin(path: str) -> Optional[np.ndarray]:
     if n_ch < 1:
         return None                          # less than one full row — unusable
     return raw[:SPATIAL_PIXELS * n_ch].reshape(SPATIAL_PIXELS, n_ch)
+
+
+def _sum_sdd_channels(path: str) -> Optional[np.ndarray]:
+    """
+    Load one SDD .bin file and sum over spatial pixels.
+
+    Returns a float64 array of shape ``(n_channels,)`` without creating an
+    additional full-size float64 copy of the entire 2-D detector matrix.
+    """
+    raw = np.fromfile(path, dtype=np.uint32)
+    if raw.size == 0:
+        return None
+    n_ch = raw.size // SPATIAL_PIXELS
+    if n_ch < 1:
+        return None
+    usable = raw[:SPATIAL_PIXELS * n_ch].reshape(SPATIAL_PIXELS, n_ch)
+    return usable.sum(axis=0, dtype=np.float64)
 
 
 def _load_mcc_csv(path: str) -> Optional[np.ndarray]:
@@ -209,34 +265,36 @@ def scan_base_dir(base: str) -> List[StackInfo]:
     if not os.path.isdir(base):
         return infos
 
-    for entry in sorted(os.listdir(base)):
-        full = os.path.join(base, entry)
-        if not os.path.isdir(full):
+    try:
+        entries = sorted(os.scandir(base), key=lambda item: item.name.lower())
+    except OSError:
+        return infos
+
+    for entry in entries:
+        if not entry.is_dir():
             continue
+        full = entry.path
 
         # ── Collect energy subdirs (primary requirement) ────────────────────
-        subdirs = sorted([
-            d for d in os.listdir(full)
-            if os.path.isdir(os.path.join(full, d))
-            and _parse_energy(d) is not None
-        ])
+        subdirs = _list_energy_subdirs(full)
 
         # Must have at least some energy subdirs to be a valid stack
         if not subdirs:
             continue
 
         has_data = any(
-            any(f.endswith('.bin') for f in os.listdir(os.path.join(full, sd)))
-            for sd in subdirs
-        ) if subdirs else False
+            _first_file_with_suffix(_list_dir_files(sd_path), '.bin') is not None
+            for _, sd_path, _ in subdirs
+        )
 
         # ── Try H5 for rich metadata ────────────────────────────────────────
-        h5files = [f for f in os.listdir(full) if f.endswith('.h5')]
-        if h5files:
-            meta = _load_h5_metadata(os.path.join(full, h5files[0]))
+        root_files = _list_dir_files(full)
+        h5_path = _first_file_with_suffix(root_files, '.h5')
+        if h5_path:
+            meta = _load_h5_metadata(h5_path)
             en   = meta['energy']
             sample = meta['sample']
-            dm = re.match(r'(\d{4}-\d{2}-\d{2})', h5files[0])
+            dm = re.match(r'(\d{4}-\d{2}-\d{2})', os.path.basename(h5_path))
             date = dm.group(1) if dm else ''
         else:
             en     = np.array([])
@@ -245,26 +303,23 @@ def scan_base_dir(base: str) -> List[StackInfo]:
 
         # ── Fallback: derive energy range from subdir names ─────────────────
         if en.size == 0:
-            energies_from_dirs = sorted(
-                _parse_energy(d) for d in subdirs if _parse_energy(d) is not None
-            )
-            en = np.array(energies_from_dirs)
+            en = np.array([e_ev for _, _, e_ev in subdirs], dtype=float)
 
         # ── Fallback: derive sample name from subdir names ──────────────────
         if not sample:
             # Subdir names look like  <sample>_<int>_<frac>eV
             # Strip the trailing _NNN_NNeV to recover sample name
-            m_sample = re.match(r'^(.+?)_\d+_\d+[Ee][Vv]$', subdirs[0])
+            m_sample = re.match(r'^(.+?)_\d+_\d+[Ee][Vv]$', subdirs[0][0])
             if m_sample:
                 sample = m_sample.group(1)
             else:
                 # Last resort: strip timestamp prefix from stack dir name
-                m_dir = re.match(r'^\d{6}_(.+?)(?:_stack)?$', entry)
-                sample = m_dir.group(1) if m_dir else entry
+                m_dir = re.match(r'^\d{6}_(.+?)(?:_stack)?$', entry.name)
+                sample = m_dir.group(1) if m_dir else entry.name
 
         infos.append(StackInfo(
             path      = full,
-            name      = entry,
+            name      = entry.name,
             sample    = sample,
             date      = date,
             energy_min= float(en.min()) if en.size else 0,
@@ -297,27 +352,35 @@ def build_spectrum(
     """
     # ── Collect energy subdirs ──────────────────────────────────────────────
     stack = info.path
-    subdirs = sorted(
-        [(d, _parse_energy(d))
-         for d in os.listdir(stack)
-         if os.path.isdir(os.path.join(stack, d)) and _parse_energy(d) is not None],
-        key=lambda x: x[1]
-    )
+    subdirs = _list_energy_subdirs(stack)
     if not subdirs:
         raise ValueError(f"No energy subdirectories found in:\n{stack}")
 
     # ── Load H5 metadata ────────────────────────────────────────────────────
-    h5files = [f for f in os.listdir(stack) if f.endswith('.h5')]
-    meta    = _load_h5_metadata(os.path.join(stack, h5files[0])) if h5files else {}
-    h5_en   = meta.get('energy', np.array([]))
-    h5_rc   = meta.get('ring_current', np.array([]))
+    root_files = _list_dir_files(stack)
+    h5_path = _first_file_with_suffix(root_files, '.h5')
+    meta    = _load_h5_metadata(h5_path) if h5_path else {}
+    h5_en   = np.asarray(meta.get('energy', np.array([])), dtype=float)
+    h5_rc   = np.asarray(meta.get('ring_current', np.array([])), dtype=float)
+    if h5_en.size and h5_rc.size:
+        order = np.argsort(h5_en)
+        h5_en = h5_en[order]
+        h5_rc = h5_rc[order]
 
     def _ring_current_at(e_ev: float) -> float:
         """Lookup ring current from H5 for a given energy."""
-        if h5_en.size == 0:
+        if h5_en.size == 0 or h5_rc.size == 0:
             return 1.0
-        idx = int(np.argmin(np.abs(h5_en - e_ev)))
-        return max(float(h5_rc[idx]), 1e-6)
+        idx = int(np.searchsorted(h5_en, e_ev))
+        if idx <= 0:
+            best = 0
+        elif idx >= h5_en.size:
+            best = h5_en.size - 1
+        else:
+            left = idx - 1
+            right = idx
+            best = right if abs(h5_en[right] - e_ev) < abs(e_ev - h5_en[left]) else left
+        return max(float(h5_rc[best]), 1e-6)
 
     # ── Which SDD files to sum ───────────────────────────────────────────────
     if detectors is None:
@@ -328,31 +391,31 @@ def build_spectrum(
     signal_list  = []
     total = len(subdirs)
 
-    for i, (dname, e_ev) in enumerate(subdirs):
+    for i, (_dname, subdir_path, e_ev) in enumerate(subdirs):
         if stop_event and stop_event.is_set():
             break
         if progress_cb:
             progress_cb(int(100 * i / total))
-
-        subdir_path = os.path.join(stack, dname)
+        subdir_files = _list_dir_files(subdir_path)
 
         # ── SDD-based signals (TFY / PFY) ───────────────────────────────────
         if signal_type in ('TFY', 'PFY'):
             sdd_sum = None   # sized lazily from first loaded file
             found   = False
             for sdd_name in sdd_names:
-                bin_path = os.path.join(subdir_path, sdd_name)
-                if os.path.isfile(bin_path):
-                    mat = _load_sdd_bin(bin_path)
-                    if mat is None:
+                bin_path = subdir_files.get(sdd_name.lower())
+                if not bin_path:
+                    continue
+                summed = _sum_sdd_channels(bin_path)
+                if summed is None:
                         continue             # empty / corrupt file — skip
-                    ch = mat.shape[1]
-                    if sdd_sum is None:
-                        sdd_sum = np.zeros(ch, dtype=np.float64)
-                    elif sdd_sum.size != ch:
-                        sdd_sum = np.zeros(ch, dtype=np.float64)
-                    sdd_sum += mat.astype(np.float64).sum(axis=0)
-                    found = True
+                ch = summed.size
+                if sdd_sum is None:
+                    sdd_sum = np.zeros(ch, dtype=np.float64)
+                elif sdd_sum.size != ch:
+                    sdd_sum = np.zeros(ch, dtype=np.float64)
+                sdd_sum += summed
+                found = True
             if sdd_sum is None:
                 sdd_sum = np.zeros(1, dtype=np.float64)
             n_ch_actual = sdd_sum.size
@@ -371,9 +434,9 @@ def build_spectrum(
                 i0 = _ring_current_at(e_ev)
                 sig = raw_sig / i0
             elif norm_by == 'mcc_i0':
-                csvs = [f for f in os.listdir(subdir_path) if f.endswith('.csv')]
-                if csvs:
-                    mcc = _load_mcc_csv(os.path.join(subdir_path, csvs[0]))
+                csv_path = _first_file_with_suffix(subdir_files, '.csv')
+                if csv_path:
+                    mcc = _load_mcc_csv(csv_path)
                     i0  = float(np.mean(mcc[:, 0])) if mcc is not None else _ring_current_at(e_ev)
                 else:
                     i0 = _ring_current_at(e_ev)
@@ -388,10 +451,10 @@ def build_spectrum(
         #   ch3 (idx 2) = PD photodiode
         #   ch4 (idx 3) = TEY (working electron yield signal at SGM)
         elif signal_type in ('TEY', 'PD', 'AEY'):
-            csvs = [f for f in os.listdir(subdir_path) if f.endswith('.csv')]
-            if not csvs:
+            csv_path = _first_file_with_suffix(subdir_files, '.csv')
+            if not csv_path:
                 continue   # no MCC data at this energy
-            mcc = _load_mcc_csv(os.path.join(subdir_path, csvs[0]))
+            mcc = _load_mcc_csv(csv_path)
             if mcc is None:
                 continue
             ch_map = {'TEY': 3, 'PD': 2, 'AEY': 1}   # TEY=ch4, PD=ch3, AEY=ch2 (drain)
@@ -521,39 +584,33 @@ def build_exem_matrix(
     sdd_names = [f'sdd{n}_0.bin' for n in detectors]
 
     stack   = info.path
-    subdirs = sorted(
-        [(d, _parse_energy(d))
-         for d in os.listdir(stack)
-         if os.path.isdir(os.path.join(stack, d)) and _parse_energy(d) is not None],
-        key=lambda t: t[1]
-    )
+    subdirs = _list_energy_subdirs(stack)
 
     energies: List[float]      = []
     rows:     List[np.ndarray] = []
     total = len(subdirs)
 
-    for i, (dname, e_ev) in enumerate(subdirs):
+    for i, (_dname, subdir_path, e_ev) in enumerate(subdirs):
         if stop_event and stop_event.is_set():
             break
         if progress_cb:
             progress_cb(int(100 * i / max(total, 1)))
-
-        subdir_path = os.path.join(stack, dname)
+        subdir_files = _list_dir_files(subdir_path)
         sdd_sum: Optional[np.ndarray] = None
 
         for sdd_name in sdd_names:
-            bin_path = os.path.join(subdir_path, sdd_name)
-            if not os.path.isfile(bin_path):
+            bin_path = subdir_files.get(sdd_name.lower())
+            if not bin_path:
                 continue
-            mat = _load_sdd_bin(bin_path)
-            if mat is None:
+            summed = _sum_sdd_channels(bin_path)
+            if summed is None:
                 continue
-            ch = mat.shape[1]
+            ch = summed.size
             if sdd_sum is None:
                 sdd_sum = np.zeros(ch, dtype=np.float64)
             elif sdd_sum.size != ch:
                 sdd_sum = np.zeros(ch, dtype=np.float64)
-            sdd_sum += mat.astype(np.float64).sum(axis=0)  # spatial sum
+            sdd_sum += summed
 
         if sdd_sum is not None:
             energies.append(e_ev)
