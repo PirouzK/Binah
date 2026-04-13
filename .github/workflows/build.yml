@@ -39,12 +39,22 @@ jobs:
         with:
           python-version: '3.11'
 
-      # ── 3. Linux: install tkinter & display (needed for matplotlib/tk) ────
-      - name: Install Linux system deps
+      # ── 3. Install tkinter system dependency ──────────────────────────────
+      # Tk ships with Python but is a system-level dependency, not a pip pkg.
+      # GitHub-hosted runners usually include it, but we ensure it explicitly.
+      - name: Install Linux system deps (tkinter, display libs)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y python3-tk libglib2.0-0 libsm6 libxrender1 libxext6
+
+      - name: Install macOS tkinter (if missing)
+        if: runner.os == 'macOS'
+        run: |
+          python -c "import tkinter" 2>/dev/null || brew install python-tk@3.11 || true
+
+      - name: Verify tkinter is available
+        run: python -c "import tkinter; print('tkinter OK')"
 
       # ── 4. Install Python dependencies ───────────────────────────────────
       - name: Install Python deps

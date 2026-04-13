@@ -23,7 +23,12 @@ A desktop application for visualising and analysing TDDFT X-ray absorption spect
 ## Requirements
 
 - Python 3.9 or newer
-- See `requirements.txt` for full dependency list
+- **tkinter** (ships with Python, but may need explicit installation):
+  - **Windows:** Reinstall Python → Custom install → check **"tcl/tk and IDLE"**
+  - **macOS:** Usually included. If not: `brew install python-tk@3.11`
+  - **Linux:** `sudo apt install python3-tk`
+  - Test with: `python -c "import tkinter; print('ok')"`
+- See `requirements.txt` for full pip dependency list
 
 ---
 

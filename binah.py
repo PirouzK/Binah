@@ -4,10 +4,27 @@ Run with: python binah.py
 Requires: matplotlib, numpy, scipy, xraylarch  (see requirements.txt)
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import os
 import sys
+
+try:
+    import tkinter as tk
+except ImportError:
+    print(
+        "\n"
+        "ERROR: tkinter is not installed.\n"
+        "tkinter ships with Python but must be enabled at install time.\n"
+        "\n"
+        "  Windows : Reinstall Python → Custom → check 'tcl/tk and IDLE'\n"
+        "  macOS   : brew install python-tk@3.11\n"
+        "  Linux   : sudo apt install python3-tk\n"
+        "\n"
+        "Test it with:  python -c \"import tkinter; print('ok')\"\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+from tkinter import ttk, filedialog, messagebox
 
 try:
     from sgm_xas_loader import SGMLoaderApp as _SGMLoaderApp
