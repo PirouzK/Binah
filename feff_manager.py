@@ -160,8 +160,28 @@ def _run_subprocess(args: list[str], cwd: str, log: Callable[[str], None],
     return proc
 
 
+def _looks_like_feff_source_tree(repo_dir: Path) -> bool:
+    return (
+        (repo_dir / "src" / "install.txt").is_file()
+        or (repo_dir / "mod" / "Seq" / "Compile_win64.BAT").is_file()
+    )
+
+
+def _remove_existing_snapshot(repo_dir: Path, log: Callable[[str], None]) -> None:
+    resolved = repo_dir.resolve()
+    if not resolved.exists():
+        return
+    if not _looks_like_feff_source_tree(resolved):
+        raise RuntimeError(
+            f"Install directory exists but is not a recognizable FEFF10 source tree: {resolved}"
+        )
+    log(f"Refreshing existing FEFF10 snapshot at {resolved} ...")
+    shutil.rmtree(resolved)
+
+
 def _download_from_git_or_zip(repo_dir: Path, log: Callable[[str], None]) -> str:
     git = shutil.which("git")
+    repo_dir.parent.mkdir(parents=True, exist_ok=True)
     if repo_dir.exists() and (repo_dir / ".git").exists() and git:
         log("Updating FEFF10 source with git pull --ff-only ...")
         proc = _run_subprocess([git, "-C", str(repo_dir), "pull", "--ff-only"], str(repo_dir), log)
@@ -170,10 +190,8 @@ def _download_from_git_or_zip(repo_dir: Path, log: Callable[[str], None]) -> str
         return "git"
 
     if repo_dir.exists():
-        log("Using existing FEFF10 source tree.")
-        return "existing"
+        _remove_existing_snapshot(repo_dir, log)
 
-    repo_dir.parent.mkdir(parents=True, exist_ok=True)
     if git:
         log("Cloning FEFF10 from GitHub ...")
         proc = _run_subprocess(
@@ -183,6 +201,9 @@ def _download_from_git_or_zip(repo_dir: Path, log: Callable[[str], None]) -> str
         )
         if proc.returncode == 0:
             return "git"
+        if repo_dir.exists():
+            log("Cleaning up partial git clone before zip fallback ...")
+            shutil.rmtree(repo_dir, ignore_errors=True)
         log("Git clone failed, falling back to GitHub zip download.")
 
     log("Downloading FEFF10 source snapshot from GitHub ...")
@@ -195,6 +216,8 @@ def _download_from_git_or_zip(repo_dir: Path, log: Callable[[str], None]) -> str
         extracted = next((p for p in temp_dir.iterdir() if p.is_dir() and p.name.startswith("feff10-")), None)
         if extracted is None:
             raise RuntimeError("GitHub archive did not contain an extracted FEFF10 folder.")
+        if repo_dir.exists():
+            raise RuntimeError(f"Install directory already exists and cannot be replaced: {repo_dir}")
         shutil.move(str(extracted), str(repo_dir))
         return "zip"
     finally:
