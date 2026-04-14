@@ -386,6 +386,14 @@ class XASAnalysisTab(tk.Frame):
         # Scan list panel — BooleanVar per label (visible in overlay)
         self._scan_vis_vars: dict = {}   # label → tk.BooleanVar
 
+        # ── Deglitch state ─────────────────────────────────────────────────────
+        # _deglitch_mode : bool — whether point-picking is active
+        # _deglitch_selected_idx : int|None — index of highlighted point in raw data
+        # _deglitch_undo : dict[label → list[(energy_ev, mu)]] — undo stack
+        self._deglitch_mode      = False
+        self._deglitch_sel_idx   = None   # index into current scan's raw arrays
+        self._deglitch_undo: dict = {}    # label → list of (energy_ev, mu) snapshots
+
         self._build_ui()
 
     # ── Layout ───────────────────────────────────────────────────────────────
@@ -400,7 +408,9 @@ class XASAnalysisTab(tk.Frame):
         self._scan_cb = ttk.Combobox(top, textvariable=self._scan_var,
                                       state="readonly", width=40)
         self._scan_cb.pack(side=tk.LEFT, padx=(4, 8))
-        self._scan_cb.bind("<<ComboboxSelected>>", lambda _e: self._auto_fill_e0())
+        self._scan_cb.bind("<<ComboboxSelected>>",
+                           lambda _e: (self._clear_deglitch_selection(),
+                                       self._auto_fill_e0()))
 
         tk.Button(top, text="\u21bb Refresh Scans", font=("", 8),
                   command=self.refresh_scan_list).pack(side=tk.LEFT, padx=2)
@@ -1375,6 +1385,26 @@ class XASAnalysisTab(tk.Frame):
         tk.Button(bar, text="\u2715 Cancel", font=("", 8), bg="#ECECEC",
                   command=lambda: self._set_click_mode("")).pack(side=tk.LEFT, padx=6)
 
+        # ── Deglitch controls (right side of toolbar) ─────────────────────────
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y,
+                                                     padx=8, pady=2)
+        self._deglitch_btn = tk.Button(
+            bar, text="\U0001f9f9 Deglitch", font=("", 8), bg="#ECECEC",
+            command=self._toggle_deglitch_mode)
+        self._deglitch_btn.pack(side=tk.LEFT, padx=2)
+
+        self._deglitch_remove_btn = tk.Button(
+            bar, text="Remove Point", font=("", 8, "bold"),
+            bg="#CC0000", fg="white", state=tk.DISABLED,
+            command=self._deglitch_remove_selected)
+        self._deglitch_remove_btn.pack(side=tk.LEFT, padx=2)
+
+        self._deglitch_undo_btn = tk.Button(
+            bar, text="Undo", font=("", 8),
+            bg="#885500", fg="white", state=tk.DISABLED,
+            command=self._deglitch_undo_last)
+        self._deglitch_undo_btn.pack(side=tk.LEFT, padx=2)
+
         self._click_hint = tk.Label(
             bar, text="  Select a parameter above, then click on the plot",
             fg="gray", font=("", 8, "italic"), bg="#ECECEC")
@@ -1401,12 +1431,20 @@ class XASAnalysisTab(tk.Frame):
                 fg="gray")
 
     def _on_plot_click(self, event):
-        mode = self._click_mode.get()
-        if not mode or event.button != 1:
+        if event.button != 1:
             return
         if getattr(self._toolbar_xanes, 'mode', ''):
             return
         if event.inaxes is None or event.xdata is None:
+            return
+
+        # ── Deglitch mode: pick nearest raw data point ────────────────────────
+        if self._deglitch_mode:
+            self._deglitch_pick_point(event)
+            return
+
+        mode = self._click_mode.get()
+        if not mode:
             return
 
         x  = event.xdata
@@ -1426,6 +1464,136 @@ class XASAnalysisTab(tk.Frame):
         self._set_click_mode("")
         if self._scan_var.get():
             self._run()
+
+    # ── Deglitch ─────────────────────────────────────────────────────────────
+
+    def _clear_deglitch_selection(self):
+        """Drop any highlighted point (e.g. when scan changes)."""
+        self._deglitch_sel_idx = None
+        if hasattr(self, '_deglitch_remove_btn'):
+            self._deglitch_remove_btn.config(state=tk.DISABLED)
+
+    def _toggle_deglitch_mode(self):
+        """Enter / exit point-picking deglitch mode."""
+        self._deglitch_mode = not self._deglitch_mode
+        self._deglitch_sel_idx = None
+
+        if self._deglitch_mode:
+            # Cancel any parameter-set click mode
+            self._set_click_mode("")
+            # Ensure raw data is visible so points can be seen
+            if hasattr(self, '_show_raw_var'):
+                self._show_raw_var.set(True)
+            self._deglitch_btn.config(relief=tk.SUNKEN, bg="#FFB347", fg="black",
+                                       font=("", 8, "bold"))
+            self._click_hint.config(
+                text="  Deglitch: click a data point to select it, then click Remove Point",
+                fg="#994400")
+        else:
+            self._deglitch_btn.config(relief=tk.RAISED, bg="#ECECEC", fg="black",
+                                       font=("", 8))
+            self._deglitch_remove_btn.config(state=tk.DISABLED)
+            self._click_hint.config(
+                text="  Select a parameter above, then click on the plot",
+                fg="gray")
+        self._redraw_xanes()
+
+    def _deglitch_pick_point(self, event):
+        """Find and highlight the raw data point nearest to the click."""
+        label = self._scan_var.get()
+        scan  = self._get_scan_by_label(label)
+        if scan is None:
+            return
+
+        # Work on the raw energy/mu stored in the scan object
+        energy = scan.energy_ev
+        mu     = scan.mu
+        if len(energy) == 0:
+            return
+
+        # Convert data coords to display pixels for both axes, find nearest point
+        ax    = self._ax_mu
+        xy_px = ax.transData.transform(np.column_stack([energy, mu]))
+        click_px = ax.transData.transform([[event.xdata, event.ydata]])[0]
+        dists = np.hypot(xy_px[:, 0] - click_px[0], xy_px[:, 1] - click_px[1])
+        nearest = int(np.argmin(dists))
+
+        # Only select if within 15 px (avoids accidental picks)
+        if dists[nearest] > 15:
+            self._deglitch_sel_idx = None
+            self._deglitch_remove_btn.config(state=tk.DISABLED)
+            self._click_hint.config(
+                text="  Click closer to a data point to select it", fg="#994400")
+        else:
+            self._deglitch_sel_idx = nearest
+            self._deglitch_remove_btn.config(state=tk.NORMAL)
+            self._click_hint.config(
+                text=f"  Selected point {nearest}: E = {energy[nearest]:.2f} eV,"
+                     f"  μ = {mu[nearest]:.4f}   →  click Remove Point to delete",
+                fg="#CC0000")
+        self._redraw_xanes()
+
+    def _deglitch_remove_selected(self):
+        """Delete the selected data point from the scan's raw arrays and re-run."""
+        label = self._scan_var.get()
+        scan  = self._get_scan_by_label(label)
+        idx   = self._deglitch_sel_idx
+        if scan is None or idx is None:
+            return
+
+        # Save undo snapshot before modifying
+        if label not in self._deglitch_undo:
+            self._deglitch_undo[label] = []
+        self._deglitch_undo[label].append(
+            (scan.energy_ev.copy(), scan.mu.copy()))
+        self._deglitch_undo_btn.config(state=tk.NORMAL)
+
+        # Delete the point
+        scan.energy_ev = np.delete(scan.energy_ev, idx)
+        scan.mu        = np.delete(scan.mu,        idx)
+
+        # Also delete from reference if present and same length
+        if (scan.ref_energy_ev is not None
+                and len(scan.ref_energy_ev) == len(scan.energy_ev) + 1):
+            scan.ref_energy_ev = np.delete(scan.ref_energy_ev, idx)
+        if (scan.ref_mu is not None
+                and len(scan.ref_mu) == len(scan.mu) + 1):
+            scan.ref_mu = np.delete(scan.ref_mu, idx)
+
+        # Invalidate cached result so _run reprocesses
+        self._results.pop(label, None)
+        self._deglitch_sel_idx = None
+        self._deglitch_remove_btn.config(state=tk.DISABLED)
+        n_removed = len(self._deglitch_undo[label])
+        self._click_hint.config(
+            text=f"  Point removed ({n_removed} removed total). Click another to continue.",
+            fg="#005500")
+
+        # Re-run analysis with updated data
+        self._run()
+
+    def _deglitch_undo_last(self):
+        """Restore the last removed point."""
+        label = self._scan_var.get()
+        scan  = self._get_scan_by_label(label)
+        if scan is None or not self._deglitch_undo.get(label):
+            return
+
+        energy_bak, mu_bak = self._deglitch_undo[label].pop()
+        scan.energy_ev = energy_bak
+        scan.mu        = mu_bak
+        self._results.pop(label, None)
+        self._deglitch_sel_idx = None
+        self._deglitch_remove_btn.config(state=tk.DISABLED)
+
+        if not self._deglitch_undo[label]:
+            self._deglitch_undo_btn.config(state=tk.DISABLED)
+
+        remaining = len(self._deglitch_undo.get(label, []))
+        self._click_hint.config(
+            text=f"  Undo: point restored  ({remaining} removal(s) remaining in history)",
+            fg="#005500")
+        self._run()
 
     # ── Empty-state figures ───────────────────────────────────────────────────
 
@@ -1906,9 +2074,27 @@ class XASAnalysisTab(tk.Frame):
             edge_step = res.get("edge_step", 1.0)
             bkg_e     = res.get("bkg_e")
 
+            # ── Deglitch overlay: show individual raw points for selected scan ─
+            is_active_scan = (label == self._scan_var.get())
+            if self._deglitch_mode and is_active_scan and mu_raw is not None:
+                # All points as small open circles
+                ax.scatter(energy, mu_raw, s=18, color=col, alpha=0.7,
+                           zorder=6, linewidths=0.8,
+                           facecolors="none", edgecolors=col,
+                           label=f"data points  {lbl_s}" if i == 0 else "_nolegend_")
+                # Highlighted selected point
+                si = self._deglitch_sel_idx
+                if si is not None and 0 <= si < len(energy):
+                    ax.scatter(energy[si], mu_raw[si], s=120, color="#CC0000",
+                               zorder=8, linewidths=1.5,
+                               marker="o", edgecolors="#660000",
+                               label=f"selected (E={energy[si]:.2f} eV)" if i == 0
+                                     else "_nolegend_")
+
             # ── Raw μ(E) ───────────────────────────────────────────────────
             if self._show_raw_var.get() and mu_raw is not None:
-                ax.plot(energy, mu_raw, color=col, lw=1.2, alpha=0.50,
+                lw_raw = 0.7 if (self._deglitch_mode and is_active_scan) else 1.2
+                ax.plot(energy, mu_raw, color=col, lw=lw_raw, alpha=0.40,
                         ls="--",
                         label=f"\u03bc(E) raw  {lbl_s}" if i == 0 else "_nolegend_")
 
