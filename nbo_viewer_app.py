@@ -966,6 +966,10 @@ def evaluate_mo_on_grid(ao_info: List[dict],
     #    Angstrom so that the isosurface renderer (which overlays on the
     #    molecular structure in Angstrom) works correctly.
 
+    # Screening threshold: skip grid points where the most diffuse
+    # primitive contributes < _SCREEN_THRESH to avoid wasting exp() calls.
+    _SCREEN_THRESH = 1e-14
+
     # Convert centres to Bohr for GTO evaluation
     centres_ang = np.array([ao["center"] for ao in ao_info])   # Angstrom
     centres_bohr = centres_ang * _ANG2BOHR
@@ -989,13 +993,46 @@ def evaluate_mo_on_grid(ao_info: List[dict],
         centre_groups.setdefault(key, []).append(i)
 
     for centre_ang, ao_indices in centre_groups.items():
+        # Skip this centre if ALL its MO coefficients are negligible
+        if all(abs(mo_coeffs[j]) < 1e-12 for j in ao_indices):
+            continue
+
+        # Find the minimum exponent across all shells on this centre
+        # (the most diffuse Gaussian — it determines the spatial extent)
+        alpha_min = 1e30
+        for j in ao_indices:
+            if abs(mo_coeffs[j]) < 1e-12:
+                continue
+            for alpha, _ in ao_info[j]["prims"]:
+                if alpha < alpha_min:
+                    alpha_min = alpha
+        if alpha_min > 1e29:
+            continue
+
+        # Cutoff radius: exp(-alpha_min * r²) < THRESH → r > sqrt(-ln(THRESH)/alpha_min)
+        r_cut = np.sqrt(-np.log(_SCREEN_THRESH) / alpha_min)
+
         # Convert this atom centre to Bohr
         cx = centre_ang[0] * _ANG2BOHR
         cy = centre_ang[1] * _ANG2BOHR
         cz = centre_ang[2] * _ANG2BOHR
-        dx = (xi_b - cx).reshape(-1, 1, 1)     # (NX,1,1)  in Bohr
-        dy = (yi_b - cy).reshape(1, -1, 1)     # (1,NY,1)  in Bohr
-        dz = (zi_b - cz).reshape(1, 1, -1)     # (1,1,NZ)  in Bohr
+
+        # Find sub-grid indices within the cutoff box
+        ix_lo = max(0, int(np.searchsorted(xi_b, cx - r_cut)))
+        ix_hi = min(NX, int(np.searchsorted(xi_b, cx + r_cut)) + 1)
+        iy_lo = max(0, int(np.searchsorted(yi_b, cy - r_cut)))
+        iy_hi = min(NY, int(np.searchsorted(yi_b, cy + r_cut)) + 1)
+        iz_lo = max(0, int(np.searchsorted(zi_b, cz - r_cut)))
+        iz_hi = min(NZ, int(np.searchsorted(zi_b, cz + r_cut)) + 1)
+
+        # Skip if the sub-grid is empty
+        if ix_hi <= ix_lo or iy_hi <= iy_lo or iz_hi <= iz_lo:
+            continue
+
+        # Build sub-grid displacement arrays (much smaller than full grid)
+        dx = (xi_b[ix_lo:ix_hi] - cx).reshape(-1, 1, 1)
+        dy = (yi_b[iy_lo:iy_hi] - cy).reshape(1, -1, 1)
+        dz = (zi_b[iz_lo:iz_hi] - cz).reshape(1, 1, -1)
         r2 = dx * dx + dy * dy + dz * dz       # Bohr²
 
         for i_ao in ao_indices:
@@ -1013,17 +1050,33 @@ def evaluate_mo_on_grid(ao_info: List[dict],
             if ang_func is None:
                 continue
 
-            # Contracted radial part (with primitive normalisation).
+            # Contracted radial part — vectorised over primitives.
             # ORCA's "BASIS SET IN INPUT FORMAT" prints raw (unnormalised)
             # contraction coefficients, so we must multiply by N_i.
-            # Both alpha and r2 are in Bohr units here, matching the
-            # standard normalisation formulas.
-            radial = np.zeros_like(r2)
-            for alpha, coeff in prims:
-                N = _norm_for_ang(ang_key, alpha)
-                radial += coeff * N * np.exp(-alpha * r2)
+            n_prim = len(prims)
+            sub_size = r2.size
 
-            val += c_mo * ang_func(dx, dy, dz) * radial
+            if n_prim <= 1:
+                # Single primitive — no need for vectorisation overhead
+                alpha, coeff = prims[0]
+                N = _norm_for_ang(ang_key, alpha)
+                radial = coeff * N * np.exp(-alpha * r2)
+            elif n_prim * sub_size < 20_000_000:
+                # Vectorised path: broadcast over primitives (fast, ~< 160 MB)
+                alphas = np.array([p[0] for p in prims])
+                cn = np.array([p[1] * _norm_for_ang(ang_key, p[0]) for p in prims])
+                exp_arr = np.exp(-alphas.reshape(-1, 1, 1, 1) * r2[np.newaxis])
+                radial = np.einsum("p,pxyz->xyz", cn, exp_arr)
+            else:
+                # Fallback for very large sub-grids: accumulate in-place
+                radial = np.zeros_like(r2)
+                for alpha, coeff in prims:
+                    N = _norm_for_ang(ang_key, alpha)
+                    radial += coeff * N * np.exp(-alpha * r2)
+
+            val[ix_lo:ix_hi, iy_lo:iy_hi, iz_lo:iz_hi] += (
+                c_mo * ang_func(dx, dy, dz) * radial
+            )
 
     # Build a cube-format dict
     # Return origin/axes in Angstrom so the isosurface renderer overlays
@@ -3694,6 +3747,12 @@ class NBOViewerApp(tk.Tk):
 
         iorb    = int(sel[0])
         spacing = self._iso_spacing.get()
+        # Quality preset overrides spacing for faster preview renders
+        quality = self._iso_quality.get()
+        if quality == "Preview":
+            spacing = max(spacing, 0.35)
+        elif quality == "High":
+            spacing = min(spacing, 0.15)
         pad     = self._iso_pad.get()
         out_path = getattr(self, "_orca_mo_path", "")
 
