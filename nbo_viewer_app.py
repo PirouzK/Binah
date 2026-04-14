@@ -777,6 +777,11 @@ def _parse_orca_mos(text: str) -> Optional[dict]:
     }
 
 
+# ── Constants ────────────────────────────────────────────────────────────────
+
+_BOHR2ANG = 0.529177210903   # 1 bohr in Angstrom
+_ANG2BOHR = 1.0 / _BOHR2ANG  # 1 Angstrom in bohr  (~1.8897)
+
 # ── GTO primitive normalisation constants ─────────────────────────────────────
 
 def _norm_s(alpha: float) -> float:
@@ -920,7 +925,7 @@ def _build_ao_info(basis: Dict[str, List[dict]],
 
 def evaluate_mo_on_grid(ao_info: List[dict],
                         mo_coeffs: np.ndarray,
-                        spacing: float = 0.30,
+                        spacing: float = 0.20,
                         padding: float = 4.5,
                         reorient_R: Optional[np.ndarray] = None,
                         reorient_T: Optional[np.ndarray] = None,
@@ -954,17 +959,27 @@ def evaluate_mo_on_grid(ao_info: List[dict],
             for ao in ao_info
         ]
 
-    # Determine grid extents from atom centres
-    centres = np.array([ao["center"] for ao in ao_info])
-    lo = centres.min(axis=0) - padding
-    hi = centres.max(axis=0) + padding
-    xi = np.arange(lo[0], hi[0] + spacing, spacing)
-    yi = np.arange(lo[1], hi[1] + spacing, spacing)
-    zi = np.arange(lo[2], hi[2] + spacing, spacing)
-    NX, NY, NZ = len(xi), len(yi), len(zi)
+    # ── IMPORTANT: ORCA basis exponents (alpha) are in Bohr⁻².
+    #    Atom coordinates from .xyz / .out are in Angstrom.
+    #    We must evaluate GTOs in Bohr so that exp(-alpha * r²) is correct.
+    #    The grid is built in Bohr; the returned cube origin/axes stay in
+    #    Angstrom so that the isosurface renderer (which overlays on the
+    #    molecular structure in Angstrom) works correctly.
 
-    # Pre-build full 3D coordinate arrays (memory-efficient broadcasting)
-    # Use (NX,1,1), (1,NY,1), (1,1,NZ) shapes for broadcasting
+    # Convert centres to Bohr for GTO evaluation
+    centres_ang = np.array([ao["center"] for ao in ao_info])   # Angstrom
+    centres_bohr = centres_ang * _ANG2BOHR
+
+    spacing_bohr = spacing * _ANG2BOHR
+    padding_bohr = padding * _ANG2BOHR
+
+    lo_bohr = centres_bohr.min(axis=0) - padding_bohr
+    hi_bohr = centres_bohr.max(axis=0) + padding_bohr
+    xi_b = np.arange(lo_bohr[0], hi_bohr[0] + spacing_bohr, spacing_bohr)
+    yi_b = np.arange(lo_bohr[1], hi_bohr[1] + spacing_bohr, spacing_bohr)
+    zi_b = np.arange(lo_bohr[2], hi_bohr[2] + spacing_bohr, spacing_bohr)
+    NX, NY, NZ = len(xi_b), len(yi_b), len(zi_b)
+
     val = np.zeros((NX, NY, NZ), dtype=np.float64)
 
     # Group AOs by unique atom centre to reuse dx/dy/dz/r2
@@ -973,17 +988,20 @@ def evaluate_mo_on_grid(ao_info: List[dict],
         key = ao["center"]
         centre_groups.setdefault(key, []).append(i)
 
-    for centre, ao_indices in centre_groups.items():
-        cx, cy, cz = centre
-        dx = (xi - cx).reshape(-1, 1, 1)     # (NX,1,1)
-        dy = (yi - cy).reshape(1, -1, 1)     # (1,NY,1)
-        dz = (zi - cz).reshape(1, 1, -1)     # (1,1,NZ)
-        r2 = dx * dx + dy * dy + dz * dz     # (NX,NY,NZ) via broadcasting
+    for centre_ang, ao_indices in centre_groups.items():
+        # Convert this atom centre to Bohr
+        cx = centre_ang[0] * _ANG2BOHR
+        cy = centre_ang[1] * _ANG2BOHR
+        cz = centre_ang[2] * _ANG2BOHR
+        dx = (xi_b - cx).reshape(-1, 1, 1)     # (NX,1,1)  in Bohr
+        dy = (yi_b - cy).reshape(1, -1, 1)     # (1,NY,1)  in Bohr
+        dz = (zi_b - cz).reshape(1, 1, -1)     # (1,1,NZ)  in Bohr
+        r2 = dx * dx + dy * dy + dz * dz       # Bohr²
 
         for i_ao in ao_indices:
             c_mo = mo_coeffs[i_ao]
             if abs(c_mo) < 1e-12:
-                continue  # skip negligible contributions
+                continue
 
             ao = ao_info[i_ao]
             ang_key = ao["ang"]
@@ -995,7 +1013,11 @@ def evaluate_mo_on_grid(ao_info: List[dict],
             if ang_func is None:
                 continue
 
-            # Contracted radial part (with primitive normalisation)
+            # Contracted radial part (with primitive normalisation).
+            # ORCA's "BASIS SET IN INPUT FORMAT" prints raw (unnormalised)
+            # contraction coefficients, so we must multiply by N_i.
+            # Both alpha and r2 are in Bohr units here, matching the
+            # standard normalisation formulas.
             radial = np.zeros_like(r2)
             for alpha, coeff in prims:
                 N = _norm_for_ang(ang_key, alpha)
@@ -1004,11 +1026,15 @@ def evaluate_mo_on_grid(ao_info: List[dict],
             val += c_mo * ang_func(dx, dy, dz) * radial
 
     # Build a cube-format dict
+    # Return origin/axes in Angstrom so the isosurface renderer overlays
+    # correctly on molecular coordinates (which are always in Angstrom).
+    lo_ang = lo_bohr * _BOHR2ANG
+
     # Unique atoms for the molecular structure
     seen = {}
     atom_list = []
     for ao in ao_info:
-        c = ao["center"]
+        c = ao["center"]   # still in Angstrom
         if c not in seen:
             seen[c] = True
             atom_list.append(c)
@@ -1020,7 +1046,7 @@ def evaluate_mo_on_grid(ao_info: List[dict],
     return {
         "comment": "MO from ORCA LargePrint",
         "atoms":   atoms_cube,
-        "origin":  np.array([lo[0], lo[1], lo[2]]),
+        "origin":  np.array([lo_ang[0], lo_ang[1], lo_ang[2]]),
         "axes":    np.diag([spacing, spacing, spacing]),
         "n":       np.array([NX, NY, NZ], dtype=int),
         "data":    val,
@@ -1030,7 +1056,7 @@ def evaluate_mo_on_grid(ao_info: List[dict],
 
 def build_cube_from_orca_output(out_path: str,
                                 mo_index: int,
-                                spacing: float = 0.30,
+                                spacing: float = 0.20,
                                 padding: float = 4.5,
                                 reorient_R: Optional[np.ndarray] = None,
                                 reorient_T: Optional[np.ndarray] = None) -> dict:
@@ -2517,7 +2543,7 @@ class NBOViewerApp(tk.Tk):
 
         r3 = tk.Frame(gc); r3.pack(fill=tk.X, pady=2)
         tk.Label(r3, text="Grid spacing (MO only):").pack(side=tk.LEFT)
-        self._iso_spacing = tk.DoubleVar(value=0.30)
+        self._iso_spacing = tk.DoubleVar(value=0.20)
         ttk.Spinbox(r3, textvariable=self._iso_spacing,
                     from_=0.10, to=0.80, increment=0.05,
                     width=6, format="%.2f").pack(side=tk.LEFT, padx=4)
