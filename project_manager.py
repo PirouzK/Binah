@@ -37,6 +37,22 @@ def _get(var, default=None):
         return default
 
 
+def _scan_metadata_for_save(meta: Any) -> dict:
+    """Keep only lightweight metadata needed for reloadable scan relationships."""
+    if not isinstance(meta, dict):
+        return {}
+    keep = {}
+    for key, val in meta.items():
+        if key.startswith("_binah_link_") or key in {
+            "merged_from_labels", "merge_source", "merge_count", "merge_overlap_ev"
+        }:
+            if hasattr(val, "tolist"):
+                keep[key] = val.tolist()
+            else:
+                keep[key] = val
+    return keep
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Save
 # ─────────────────────────────────────────────────────────────────────────────
@@ -65,7 +81,9 @@ def save_project(path: str, app) -> None:
             "energy_ev":    _arr(scan.energy_ev),
             "mu":           _arr(scan.mu),
             "e0":           float(scan.e0),
+            "is_normalized": bool(scan.is_normalized),
             "scan_type":    scan.scan_type,
+            "metadata":     _scan_metadata_for_save(getattr(scan, "metadata", {})),
             "enabled":      bool(_get(var, True)),
             "style":        dict(style),
         })
@@ -207,8 +225,9 @@ def restore_project(doc: dict, app) -> list:
                 energy_ev=np.array(entry["energy_ev"], dtype=float),
                 mu=np.array(entry["mu"], dtype=float),
                 e0=float(entry.get("e0", 0.0)),
-                is_normalized=True,
+                is_normalized=bool(entry.get("is_normalized", True)),
                 scan_type=entry.get("scan_type", "normalized"),
+                metadata=dict(entry.get("metadata", {})),
             )
             style   = dict(entry.get("style", {}))
             enabled = bool(entry.get("enabled", True))

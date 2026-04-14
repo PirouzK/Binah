@@ -23,7 +23,12 @@ A desktop application for visualising and analysing TDDFT X-ray absorption spect
 ## Requirements
 
 - Python 3.9 or newer
-- See `requirements.txt` for full dependency list
+- **tkinter** (ships with Python, but may need explicit installation):
+  - **Windows:** Reinstall Python → Custom install → check **"tcl/tk and IDLE"**
+  - **macOS:** Usually included. If not: `brew install python-tk@3.11`
+  - **Linux:** `sudo apt install python3-tk`
+  - Test with: `python -c "import tkinter; print('ok')"`
+- See `requirements.txt` for full pip dependency list
 
 ---
 
@@ -46,7 +51,7 @@ pip install -r requirements.txt
 python binah.py
 ```
 
-> **Note:** The SGM beamline loader (`sgmanalysis`) is optional — the app will work without it if you do not need to load CLS SGM data files.
+> **Note:** This repository now bundles the `sgmanalysis` source used for CLS SGM data support, so you do not need a separate checkout of `SGMPython`.
 
 ---
 
@@ -102,6 +107,7 @@ xas_analysis_tab.py    — XAS pre-edge analysis panel
 project_manager.py     — Project save / load (.otproj)
 sgm_xas_loader.py      — CLS SGM beamline data loader
 ledge_normalizer.py    — L-edge normalisation utilities
+sgmanalysis/           — Bundled SGMPython analysis package
 ```
 
 ---

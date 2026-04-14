@@ -4,10 +4,27 @@ Run with: python binah.py
 Requires: matplotlib, numpy, scipy, xraylarch  (see requirements.txt)
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
 import os
 import sys
+
+try:
+    import tkinter as tk
+except ImportError:
+    print(
+        "\n"
+        "ERROR: tkinter is not installed.\n"
+        "tkinter ships with Python but must be enabled at install time.\n"
+        "\n"
+        "  Windows : Reinstall Python → Custom → check 'tcl/tk and IDLE'\n"
+        "  macOS   : brew install python-tk@3.11\n"
+        "  Linux   : sudo apt install python3-tk\n"
+        "\n"
+        "Test it with:  python -c \"import tkinter; print('ok')\"\n",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+from tkinter import ttk, filedialog, messagebox
 
 try:
     from sgm_xas_loader import SGMLoaderApp as _SGMLoaderApp
@@ -190,6 +207,7 @@ class OrcaTDDFTApp(tk.Tk):
             xas_frame,
             get_scans_fn=lambda: self._plot._exp_scans,
             replot_fn=lambda: self._plot._replot(),
+            add_scan_fn=self._add_exp_scan_to_plot,
         )
         self._xas_tab.pack(fill=tk.BOTH, expand=True)
 
@@ -596,8 +614,9 @@ class OrcaTDDFTApp(tk.Tk):
             messagebox.showerror(
                 "SGM Loader",
                 "SGM loader not available.\n\n"
-                "Install sgmanalysis:\n"
-                "pip install git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git")
+                "The bundled SGM loader could not be imported.\n"
+                "Check that the repository files are present and the dependencies\n"
+                "from requirements.txt are installed.")
             return
         try:
             # SGMLoaderApp is now a tk.Toplevel — pass self as master so it

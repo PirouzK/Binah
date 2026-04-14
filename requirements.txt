@@ -1,3 +1,10 @@
+# NOTE: tkinter (Tk) is required but is NOT a pip package.
+# It ships with Python's standard library.
+#   - Windows:  reinstall Python and tick "tcl/tk and IDLE"
+#   - macOS:    usually included; if not: brew install python-tk@3.11
+#   - Linux:    sudo apt install python3-tk  (or yum install python3-tkinter)
+# You can test it with:  python -c "import tkinter; print('ok')"
+
 # Core plotting & numerics
 matplotlib>=3.7
 numpy>=1.24
@@ -12,10 +19,9 @@ h5py>=3.8
 # XAS panel visualisation
 seaborn>=0.12
 
-# SGM beamline data loader (Canadian Light Source)
-# Install manually if needed:
-#   pip install git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git
-sgmanalysis @ git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git
+# Bundled sgmanalysis support
+scikit-learn>=1.3
+plotly>=5.0
 
 # Image export (used internally by matplotlib)
 pillow>=9.0

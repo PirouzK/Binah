@@ -1,7 +1,7 @@
 """
 Interactive TDDFT / XAS plot widget using matplotlib embedded in tkinter.
 Supports single-spectrum view, multi-spectrum TDDFT overlay, and experimental
-XAS scan overlay on a twin right y-axis with ΔE energy-shift alignment.
+XAS scan overlay on a twin axis with ΔE energy-shift alignment.
 """
 
 import numpy as np
@@ -165,8 +165,8 @@ class PlotWidget(tk.Frame):
     """
     Embeds a matplotlib figure with a controls strip.
     Supports:
-      - Single spectrum view + multi-spectrum TDDFT overlay (left y-axis)
-      - Experimental XAS scans on twin right y-axis
+      - Single spectrum view + multi-spectrum TDDFT overlay (right y-axis)
+      - Experimental XAS scans on left y-axis
       - ΔE shift: nudge all TDDFT positions to align with experimental
       - Per-overlay enable/disable, style control and label editing
       - Global TDDFT style (envelope/stick) and per-scan experimental style
@@ -185,6 +185,7 @@ class PlotWidget(tk.Frame):
 
         # Experimental scan list: [(label, ExperimentalScan, enabled_BooleanVar, style_dict), ...]
         self._exp_scans: List[Tuple[str, ExperimentalScan, tk.BooleanVar, dict]] = []
+        self._exp_link_counter = 1
 
         # Global style dictionaries
         self._tddft_style = _default_tddft_style()
@@ -246,8 +247,10 @@ class PlotWidget(tk.Frame):
         # Manual axis-range overrides (empty string = auto-scale)
         self._xlim_lo = tk.StringVar(value="")
         self._xlim_hi = tk.StringVar(value="")
-        self._ylim_lo = tk.StringVar(value="")   # left / TDDFT axis
+        self._ylim_lo = tk.StringVar(value="")   # right / TDDFT axis
         self._ylim_hi = tk.StringVar(value="")
+        self._yleft_lo = tk.StringVar(value="")  # left / experimental axis
+        self._yleft_hi = tk.StringVar(value="")
 
         # Font controls — sizes and bold toggles for each text element
         self._font_title_size   = tk.IntVar(value=11)
@@ -546,8 +549,8 @@ class PlotWidget(tk.Frame):
 
         _sep2()
 
-        # ── Y axis range (left / TDDFT) ───────────────────────────────────
-        tk.Label(bar, text="Y:", font=("", 9), bg="#e8f0e8").pack(side=tk.LEFT)
+        # ── Y axis range (right / TDDFT) ──────────────────────────────────
+        tk.Label(bar, text="Y right (TDDFT):", font=("", 9), bg="#e8f0e8").pack(side=tk.LEFT)
         ey_lo = tk.Entry(bar, textvariable=self._ylim_lo, width=7, font=("Courier", 9))
         ey_lo.pack(side=tk.LEFT, padx=(2, 0))
         ey_lo.bind("<Return>",   lambda e: self._replot())
@@ -557,12 +560,27 @@ class PlotWidget(tk.Frame):
         ey_hi.pack(side=tk.LEFT)
         ey_hi.bind("<Return>",   lambda e: self._replot())
         ey_hi.bind("<FocusOut>", lambda e: self._replot())
-        tk.Button(bar, text="Auto Y", font=("", 8), bg="#e8f0e8",
+        tk.Button(bar, text="Auto Y right", font=("", 8), bg="#e8f0e8",
                   command=self._auto_y).pack(side=tk.LEFT, padx=(2, 0))
 
         _sep2()
 
         # ── Inset ─────────────────────────────────────────────────────────
+        tk.Label(bar, text="Y left (Exp):", font=("", 9), bg="#e8f0e8").pack(side=tk.LEFT)
+        ey2_lo = tk.Entry(bar, textvariable=self._yleft_lo, width=7, font=("Courier", 9))
+        ey2_lo.pack(side=tk.LEFT, padx=(2, 0))
+        ey2_lo.bind("<Return>",   lambda e: self._replot())
+        ey2_lo.bind("<FocusOut>", lambda e: self._replot())
+        tk.Label(bar, text="→", bg="#e8f0e8").pack(side=tk.LEFT, padx=1)
+        ey2_hi = tk.Entry(bar, textvariable=self._yleft_hi, width=7, font=("Courier", 9))
+        ey2_hi.pack(side=tk.LEFT)
+        ey2_hi.bind("<Return>",   lambda e: self._replot())
+        ey2_hi.bind("<FocusOut>", lambda e: self._replot())
+        tk.Button(bar, text="Auto Y left", font=("", 8), bg="#e8f0e8",
+                  command=self._auto_y_left).pack(side=tk.LEFT, padx=(2, 0))
+
+        _sep2()
+
         self._inset_btn = tk.Button(
             bar, text="+ Add Inset\u2026", font=("", 8, "bold"), bg="#e8f0e8",
             fg="darkgreen", command=self._open_inset_dialog)
@@ -577,8 +595,8 @@ class PlotWidget(tk.Frame):
         tk.Label(bar, text="Y labels:", font=("", 8, "bold"),
                  bg="#e8f0e8").pack(side=tk.LEFT, padx=(0, 2))
 
-        # Left Y
-        tk.Checkbutton(bar, text="Left:", variable=self._show_left_ylabel,
+        # Left Y = experimental
+        tk.Checkbutton(bar, text="Left (Exp):", variable=self._show_left_ylabel,
                        command=self._replot, bg="#e8f0e8",
                        font=("", 8)).pack(side=tk.LEFT)
         self._left_ylabel_entry = tk.Entry(
@@ -588,10 +606,10 @@ class PlotWidget(tk.Frame):
         self._left_ylabel_entry.bind("<Return>",   lambda _: self._replot())
         self._left_ylabel_entry.bind("<FocusOut>", lambda _: self._replot())
         _ToolTip(self._left_ylabel_entry,
-                 "Custom left Y-axis label.\nLeave blank to use the auto label.")
+                 "Custom left Y-axis label for experimental data.\nLeave blank to use the auto label.")
 
-        # Right Y
-        tk.Checkbutton(bar, text="Right:", variable=self._show_right_ylabel,
+        # Right Y = TDDFT
+        tk.Checkbutton(bar, text="Right (TDDFT):", variable=self._show_right_ylabel,
                        command=self._replot, bg="#e8f0e8",
                        font=("", 8)).pack(side=tk.LEFT)
         self._right_ylabel_entry = tk.Entry(
@@ -601,7 +619,7 @@ class PlotWidget(tk.Frame):
         self._right_ylabel_entry.bind("<Return>",   lambda _: self._replot())
         self._right_ylabel_entry.bind("<FocusOut>", lambda _: self._replot())
         _ToolTip(self._right_ylabel_entry,
-                 "Custom right Y-axis label.\nLeave blank to use the auto label.")
+                 "Custom right Y-axis label for TDDFT data.\nLeave blank to use the auto label.")
 
     def _auto_x(self):
         self._xlim_lo.set("")
@@ -611,6 +629,11 @@ class PlotWidget(tk.Frame):
     def _auto_y(self):
         self._ylim_lo.set("")
         self._ylim_hi.set("")
+        self._replot()
+
+    def _auto_y_left(self):
+        self._yleft_lo.set("")
+        self._yleft_hi.set("")
         self._replot()
 
     def _on_inset_labels_toggle(self):
@@ -814,6 +837,14 @@ class PlotWidget(tk.Frame):
                   width=10, font=("", 8)).pack(side=tk.RIGHT, padx=2)
         tk.Button(hdr, text="Clear Exp.", command=self._clear_exp_scans,
                   width=9, font=("", 8)).pack(side=tk.RIGHT, padx=2)
+        tk.Button(hdr, text="Detach", command=self._unlink_selected_exp_scans,
+                  width=7, font=("", 8)).pack(side=tk.RIGHT, padx=2)
+        tk.Button(hdr, text="Attach Ref", command=self._link_selected_exp_scans,
+                  width=9, font=("", 8)).pack(side=tk.RIGHT, padx=2)
+        tk.Button(hdr, text="Merge Orig.", command=lambda: self._merge_exp_scans(use_original=True),
+                  width=10, font=("", 8)).pack(side=tk.RIGHT, padx=2)
+        tk.Button(hdr, text="Merge Curr.", command=lambda: self._merge_exp_scans(use_original=False),
+                  width=10, font=("", 8)).pack(side=tk.RIGHT, padx=2)
         tk.Button(hdr, text="Edit Labels\u2026", command=self._open_legend_editor,
                   width=9, font=("", 8)).pack(side=tk.RIGHT, padx=2)
 
@@ -883,12 +914,12 @@ class PlotWidget(tk.Frame):
             if self._overlay_mode.get() and self._overlay_spectra:
                 ttk.Separator(self._ov_inner, orient=tk.HORIZONTAL).pack(
                     fill=tk.X, pady=(3, 1))
-            tk.Label(self._ov_inner, text="Experimental Scans (right axis \u2192):",
+            tk.Label(self._ov_inner, text="Experimental Scans (left axis \u2190):",
                      font=("", 8, "bold"), fg="darkred").pack(anchor="w", padx=4, pady=(2, 0))
             for i, (label, scan, var, style) in enumerate(self._exp_scans):
                 colour = style.get("color") or EXP_COLOURS[i % len(EXP_COLOURS)]
                 self._make_panel_row(
-                    self._ov_inner, label, var, colour,
+                    self._ov_inner, self._link_display_label(label, scan), var, colour,
                     remove_cmd=lambda idx=i: self._remove_exp_scan_idx(idx),
                     style_cmd=lambda idx=i: self._open_exp_style_dialog(idx),
                     color_cmd=lambda idx=i: self._pick_exp_colour(idx),
@@ -901,6 +932,144 @@ class PlotWidget(tk.Frame):
     # Alias kept for external callers
     def _refresh_overlay_panel(self):
         self._refresh_panel_content()
+
+    def _ensure_exp_scan_original_backup(self, scan: ExperimentalScan):
+        """Persist the originally loaded curve so later processing stays reversible."""
+        meta = getattr(scan, "metadata", None)
+        if meta is None:
+            scan.metadata = {}
+            meta = scan.metadata
+        if "_binah_original_energy" not in meta:
+            meta["_binah_original_energy"] = np.array(scan.energy_ev, dtype=float).copy()
+            meta["_binah_original_mu"] = np.array(scan.mu, dtype=float).copy()
+            meta["_binah_original_e0"] = float(scan.e0)
+            meta["_binah_original_norm"] = bool(scan.is_normalized)
+            meta["_binah_original_scan_type"] = str(getattr(scan, "scan_type", ""))
+
+    def _exp_link_meta(self, scan: ExperimentalScan) -> tuple:
+        meta = getattr(scan, "metadata", {}) or {}
+        return meta.get("_binah_link_group", ""), meta.get("_binah_link_role", "")
+
+    def _selected_exp_entries(self):
+        return [
+            (i, label, scan, var, style)
+            for i, (label, scan, var, style) in enumerate(self._exp_scans)
+            if var.get()
+        ]
+
+    def _new_exp_link_group_id(self) -> str:
+        existing = set()
+        for _label, scan, _var, _style in self._exp_scans:
+            meta = getattr(scan, "metadata", {}) or {}
+            gid = meta.get("_binah_link_group")
+            if gid:
+                existing.add(str(gid))
+        while True:
+            gid = f"exp-link-{self._exp_link_counter}"
+            self._exp_link_counter += 1
+            if gid not in existing:
+                return gid
+
+    def _cleanup_exp_link_groups(self):
+        groups = {}
+        for _label, scan, _var, _style in self._exp_scans:
+            meta = getattr(scan, "metadata", None) or {}
+            gid = meta.get("_binah_link_group")
+            if gid:
+                groups.setdefault(gid, []).append(scan)
+
+        for gid, scans in groups.items():
+            if len(scans) < 2:
+                for scan in scans:
+                    meta = getattr(scan, "metadata", None) or {}
+                    meta.pop("_binah_link_group", None)
+                    meta.pop("_binah_link_role", None)
+                continue
+
+            ref_found = False
+            for scan in scans:
+                meta = getattr(scan, "metadata", None) or {}
+                role = meta.get("_binah_link_role")
+                if role == "reference" and not ref_found:
+                    ref_found = True
+                else:
+                    meta["_binah_link_role"] = "linked"
+
+            if not ref_found and scans:
+                scans[0].metadata["_binah_link_role"] = "reference"
+
+    def _link_display_label(self, label: str, scan: ExperimentalScan) -> str:
+        _gid, role = self._exp_link_meta(scan)
+        if role == "reference":
+            return f"[Ref] {label}"
+        if role == "linked":
+            return f"[Linked] {label}"
+        return label
+
+    def _link_selected_exp_scans(self):
+        selected = self._selected_exp_entries()
+        if len(selected) < 2:
+            messagebox.showinfo(
+                "Attach Reference / Raw",
+                "Enable at least two experimental scans first.\n\n"
+                "The first enabled scan becomes the reference, and the others follow its energy calibration."
+            )
+            return
+
+        gid = self._new_exp_link_group_id()
+
+        for idx, (_row_idx, _label, scan, _var, _style) in enumerate(selected):
+            self._ensure_exp_scan_original_backup(scan)
+            meta = getattr(scan, "metadata", None)
+            if meta is None:
+                scan.metadata = {}
+                meta = scan.metadata
+            meta["_binah_link_group"] = gid
+            meta["_binah_link_role"] = "reference" if idx == 0 else "linked"
+
+        self._cleanup_exp_link_groups()
+        ref_label = selected[0][1]
+        n_linked = max(0, len(selected) - 1)
+        self._refresh_panel_content()
+        self._replot()
+        messagebox.showinfo(
+            "Attach Reference / Raw",
+            f"Attached {len(selected)} scans into one calibration group.\n\n"
+            f"Reference: {ref_label}\n"
+            f"Followers: {n_linked}\n\n"
+            f"Now when you shift the reference energy in XAS Analysis, the linked raw scans will move with it."
+        )
+
+    def _unlink_selected_exp_scans(self):
+        selected = self._selected_exp_entries()
+        if not selected:
+            messagebox.showinfo(
+                "Detach Linked Scans",
+                "Enable one or more linked experimental scans to detach."
+            )
+            return
+
+        changed = 0
+        for _row_idx, _label, scan, _var, _style in selected:
+            meta = getattr(scan, "metadata", None) or {}
+            if "_binah_link_group" in meta or "_binah_link_role" in meta:
+                meta.pop("_binah_link_group", None)
+                meta.pop("_binah_link_role", None)
+                changed += 1
+
+        self._cleanup_exp_link_groups()
+        self._refresh_panel_content()
+        self._replot()
+        if changed:
+            messagebox.showinfo(
+                "Detach Linked Scans",
+                f"Detached {changed} scan(s) from calibration groups."
+            )
+        else:
+            messagebox.showinfo(
+                "Detach Linked Scans",
+                "None of the enabled scans were linked."
+            )
 
     def _update_overlay_panel_visibility(self):
         should_show = self._overlay_mode.get() or bool(self._exp_scans)
@@ -1418,11 +1587,137 @@ class PlotWidget(tk.Frame):
         self._replot()
 
     def add_exp_scan(self, label: str, scan: ExperimentalScan):
+        self._ensure_exp_scan_original_backup(scan)
         var   = tk.BooleanVar(value=True)
         style = _default_exp_style()
         self._exp_scans.append((label, scan, var, style))
         self._refresh_panel_content()
         self._replot()
+
+    def _next_exp_merge_label(self, base: str) -> str:
+        existing = {lbl for lbl, *_ in self._exp_scans}
+        if base not in existing:
+            return base
+        idx = 2
+        while f"{base} #{idx}" in existing:
+            idx += 1
+        return f"{base} #{idx}"
+
+    def _exp_merge_source_arrays(self, scan: ExperimentalScan, use_original: bool):
+        meta = getattr(scan, "metadata", {}) or {}
+        if use_original and "_binah_original_energy" in meta and "_binah_original_mu" in meta:
+            energy = np.array(meta["_binah_original_energy"], dtype=float).copy()
+            mu = np.array(meta["_binah_original_mu"], dtype=float).copy()
+            is_norm = bool(meta.get("_binah_original_norm", scan.is_normalized))
+            e0 = float(meta.get("_binah_original_e0", scan.e0))
+            scan_type = str(meta.get("_binah_original_scan_type", getattr(scan, "scan_type", "")))
+        else:
+            energy = np.array(scan.energy_ev, dtype=float).copy()
+            mu = np.array(scan.mu, dtype=float).copy()
+            is_norm = bool(scan.is_normalized)
+            e0 = float(scan.e0)
+            scan_type = str(getattr(scan, "scan_type", ""))
+
+        order = np.argsort(energy)
+        energy = energy[order]
+        mu = mu[order]
+        energy, unique_idx = np.unique(energy, return_index=True)
+        mu = mu[unique_idx]
+        return energy, mu, is_norm, e0, scan_type
+
+    def _merge_exp_scans(self, use_original: bool = False):
+        selected = [(lbl, scan) for lbl, scan, var, _style in self._exp_scans if var.get()]
+        if len(selected) < 2:
+            messagebox.showinfo(
+                "Merge Experimental Scans",
+                "Enable at least two experimental scans to merge."
+            )
+            return
+
+        series = []
+        norm_flags = []
+        for lbl, scan in selected:
+            self._ensure_exp_scan_original_backup(scan)
+            energy, mu, is_norm, e0, scan_type = self._exp_merge_source_arrays(
+                scan, use_original=use_original)
+            if len(energy) < 2:
+                continue
+            series.append((lbl, energy, mu, e0, scan_type))
+            norm_flags.append(is_norm)
+
+        if len(series) < 2:
+            messagebox.showerror(
+                "Merge Experimental Scans",
+                "At least two scans need usable energy data to merge."
+            )
+            return
+
+        if any(flag != norm_flags[0] for flag in norm_flags):
+            source_txt = "original loaded" if use_original else "current"
+            messagebox.showerror(
+                "Merge Experimental Scans",
+                "Cannot merge a mixture of raw and normalized scans from the same source.\n\n"
+                f"Choose scans with the same normalization state, or switch to the other merge mode.\n"
+                f"Current mode: {source_txt} data."
+            )
+            return
+
+        overlap_lo = max(float(en.min()) for _, en, *_ in series)
+        overlap_hi = min(float(en.max()) for _, en, *_ in series)
+        if overlap_hi <= overlap_lo:
+            messagebox.showerror(
+                "Merge Experimental Scans",
+                "The selected scans do not share an overlapping energy range."
+            )
+            return
+
+        ref_idx = max(
+            range(len(series)),
+            key=lambda i: int(np.count_nonzero(
+                (series[i][1] >= overlap_lo) & (series[i][1] <= overlap_hi)))
+        )
+        ref_energy = series[ref_idx][1]
+        grid = ref_energy[(ref_energy >= overlap_lo) & (ref_energy <= overlap_hi)]
+        if len(grid) < 2:
+            grid = np.linspace(overlap_lo, overlap_hi, 400)
+
+        merged_rows = []
+        for _lbl, energy, mu, _e0, _stype in series:
+            merged_rows.append(np.interp(grid, energy, mu))
+        merged_arr = np.vstack(merged_rows)
+        merged_mu = np.mean(merged_arr, axis=0)
+
+        valid_e0 = [e0 for _, _, _, e0, _ in series if e0 > 0]
+        merged_e0 = float(np.mean(valid_e0)) if valid_e0 else 0.0
+        merged_is_norm = bool(norm_flags[0])
+        merge_kind = "normalized" if merged_is_norm else "raw"
+        label = self._next_exp_merge_label(
+            f"Merged {merge_kind} ({len(series)} scans, {'original' if use_original else 'current'})")
+
+        merged_scan = ExperimentalScan(
+            label=label,
+            source_file="merged://experimental",
+            energy_ev=grid,
+            mu=merged_mu,
+            e0=merged_e0,
+            is_normalized=merged_is_norm,
+            scan_type=f"merged {merge_kind}",
+            metadata={
+                "merged_from_labels": [lbl for lbl, *_ in series],
+                "merge_source": "original" if use_original else "current",
+                "merge_count": len(series),
+                "merge_overlap_ev": [overlap_lo, overlap_hi],
+            },
+        )
+        self.add_exp_scan(label, merged_scan)
+        source_txt = "original loaded" if use_original else "current"
+        messagebox.showinfo(
+            "Merge Experimental Scans",
+            f"Created merged scan:\n{label}\n\n"
+            f"Source: {source_txt}\n"
+            f"Scans merged: {len(series)}\n"
+            f"Overlap: {overlap_lo:.2f} to {overlap_hi:.2f} eV"
+        )
 
     def _remove_overlay_idx(self, idx: int):
         if 0 <= idx < len(self._overlay_spectra):
@@ -1694,18 +1989,19 @@ class PlotWidget(tk.Frame):
                     ("exp", x_exp.copy(), mu_exp.copy(), colour, lw, ls, 0.9,
                      style.get("fill", True), style.get("fill_alpha", 0.06)))
 
-            _right_lbl = (self._custom_right_ylabel.get().strip()
-                          or "\u03bc(E) \u2014 normalized XAS")
-            _show_right = self._show_right_ylabel.get()
+            _left_lbl = (self._custom_left_ylabel.get().strip()
+                         or "\u03bc(E) \u2014 normalized XAS")
+            _show_left = self._show_left_ylabel.get()
             self.ax2.set_ylabel(
-                _right_lbl if _show_right else "",
+                _left_lbl if _show_left else "",
                 fontsize=self._font_ylabel_size.get(),
                 fontweight="bold" if self._font_ylabel_bold.get() else "normal",
                 color="darkred")
             self.ax2.tick_params(
                 axis="y",
-                labelcolor="darkred" if _show_right else "none",
-                labelright=_show_right,
+                labelcolor="darkred" if _show_left else "none",
+                labelleft=_show_left,
+                labelright=False,
             )
             self.ax2.axhline(0, color="darkred", linewidth=0.4, alpha=0.3)
 
@@ -1727,11 +2023,22 @@ class PlotWidget(tk.Frame):
             self._xlabel(),
             fontsize=self._font_xlabel_size.get(),
             fontweight="bold" if self._font_xlabel_bold.get() else "normal")
-        _left_lbl = self._custom_left_ylabel.get().strip() or ylabel
+        _right_lbl = self._custom_right_ylabel.get().strip() or ylabel
         self.ax.set_ylabel(
-            _left_lbl if self._show_left_ylabel.get() else "",
+            _right_lbl if self._show_right_ylabel.get() else "",
             fontsize=self._font_ylabel_size.get(),
             fontweight="bold" if self._font_ylabel_bold.get() else "normal")
+
+        # Visual axis placement: experimental labels on the left, TDDFT on the right.
+        self.ax.yaxis.set_label_position("right")
+        self.ax.yaxis.tick_right()
+        self.ax.spines["right"].set_visible(True)
+        self.ax.spines["left"].set_visible(False)
+        if self.ax2 is not None:
+            self.ax2.yaxis.set_label_position("left")
+            self.ax2.yaxis.tick_left()
+            self.ax2.spines["left"].set_visible(True)
+            self.ax2.spines["right"].set_visible(False)
 
         title = self._custom_title.get().strip() or self._auto_title()
         self.ax.set_title(
@@ -1739,15 +2046,23 @@ class PlotWidget(tk.Frame):
             fontsize=self._font_title_size.get(),
             fontweight="bold" if self._font_title_bold.get() else "normal")
 
-        # Tick label size (both axes) — right axis also respects show/hide checkbox
+        # Tick label size (both axes) — visual right axis is TDDFT, left axis is experimental
+        _show_right = self._show_right_ylabel.get()
         self.ax.tick_params(axis="both", labelsize=self._font_tick_size.get())
+        self.ax.tick_params(
+            axis="y",
+            labelleft=False,
+            labelright=_show_right,
+            labelcolor="navy" if _show_right else "none",
+        )
         if self.ax2 is not None:
-            _show_right = self._show_right_ylabel.get()
+            _show_left = self._show_left_ylabel.get()
             self.ax2.tick_params(
                 axis="y",
                 labelsize=self._font_tick_size.get(),
-                labelcolor="darkred" if _show_right else "none",
-                labelright=_show_right,
+                labelcolor="darkred" if _show_left else "none",
+                labelleft=_show_left,
+                labelright=False,
             )
         self.ax.set_facecolor(self._bg_colour)
         self.fig.patch.set_facecolor(self._bg_colour)
@@ -1770,6 +2085,8 @@ class PlotWidget(tk.Frame):
         x_hi = _parse_float(self._xlim_hi)
         y_lo = _parse_float(self._ylim_lo)
         y_hi = _parse_float(self._ylim_hi)
+        y_left_lo = _parse_float(self._yleft_lo)
+        y_left_hi = _parse_float(self._yleft_hi)
         if x_lo is not None or x_hi is not None:
             cur = self.ax.get_xlim()
             self.ax.set_xlim(x_lo if x_lo is not None else cur[0],
@@ -1778,6 +2095,10 @@ class PlotWidget(tk.Frame):
             cur = self.ax.get_ylim()
             self.ax.set_ylim(y_lo if y_lo is not None else cur[0],
                              y_hi if y_hi is not None else cur[1])
+        if self.ax2 is not None and (y_left_lo is not None or y_left_hi is not None):
+            cur = self.ax2.get_ylim()
+            self.ax2.set_ylim(y_left_lo if y_left_lo is not None else cur[0],
+                              y_left_hi if y_left_hi is not None else cur[1])
 
         # Corner annotations for any active adjustments
         ann_lines = []
@@ -2043,6 +2364,15 @@ class PlotWidget(tk.Frame):
             inset_ax2 = inset_ax.twinx()
             inset_ax2.set_navigate(False)
             self._inset_ax2 = inset_ax2
+            inset_ax2.yaxis.set_label_position("left")
+            inset_ax2.yaxis.tick_left()
+            inset_ax2.spines["left"].set_visible(True)
+            inset_ax2.spines["right"].set_visible(False)
+
+        inset_ax.yaxis.set_label_position("right")
+        inset_ax.yaxis.tick_right()
+        inset_ax.spines["right"].set_visible(True)
+        inset_ax.spines["left"].set_visible(False)
 
         # ── Plot data ────────────────────────────────────────────────────────
         for d in self._inset_plot_data:
@@ -2132,13 +2462,13 @@ class PlotWidget(tk.Frame):
         if not has_tddft:
             inset_ax.yaxis.set_visible(False)
         else:
-            inset_ax.tick_params(labelsize=7, labelleft=show_lbl)
+            inset_ax.tick_params(labelsize=7, labelleft=False, labelright=show_lbl)
         inset_ax.tick_params(labelsize=7, labelbottom=show_lbl)
 
         if self._inset_ax2 is not None:
             self._inset_ax2.tick_params(
                 axis="y", labelsize=6, labelcolor="darkred",
-                labelright=show_lbl)
+                labelleft=show_lbl, labelright=False)
 
         inset_ax.set_facecolor(self._bg_colour)
 

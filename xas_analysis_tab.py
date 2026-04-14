@@ -18,6 +18,8 @@ import json
 import os
 import numpy as np
 from scipy.interpolate import UnivariateSpline
+from scipy.ndimage import median_filter
+from scipy.signal import savgol_filter
 import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
@@ -108,7 +110,7 @@ def _get_larch_session():
     return _LARCH_SESSION
 
 
-from experimental_parser import ExperimentalScan
+from experimental_parser import ExperimentalScan, align_and_average_scans
 
 # ── Physical constant ──────────────────────────────────────────────────────────
 # k [Å⁻¹] = sqrt(ETOK * (E-E0) [eV])    where  ETOK = 2m/ℏ²  in eV⁻¹·Å⁻²
@@ -367,10 +369,12 @@ class XASAnalysisTab(tk.Frame):
     _SCAN_COLOURS = _PALETTE
 
     def __init__(self, parent, get_scans_fn: Callable,
-                 replot_fn: Optional[Callable] = None):
+                 replot_fn: Optional[Callable] = None,
+                 add_scan_fn: Optional[Callable] = None):
         super().__init__(parent)
-        self._get_scans = get_scans_fn
-        self._replot_fn = replot_fn   # called after apply-all to refresh Spectra tab
+        self._get_scans  = get_scans_fn
+        self._replot_fn  = replot_fn    # called after apply-all to refresh Spectra tab
+        self._add_scan_fn = add_scan_fn  # called to push an averaged scan back to Binah
 
         # Analysis results cache per scan label
         self._results: dict = {}
@@ -416,6 +420,12 @@ class XASAnalysisTab(tk.Frame):
         tk.Button(top, text="\u2713 Apply norm to ALL scans",
                   bg="#1a5c1a", fg="white", font=("", 9, "bold"),
                   command=self._apply_norm_all).pack(side=tk.LEFT, padx=2)
+
+        ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
+
+        tk.Button(top, text="\u2211 Average Scans\u2026",
+                  bg="#5c1a5c", fg="white", font=("", 9, "bold"),
+                  command=self._open_average_dialog).pack(side=tk.LEFT, padx=2)
 
         self._status_lbl = tk.Label(top, text="Load experimental scans first (File \u2192 Load Exp. Data)",
                                      fg="gray", font=("", 8))
@@ -681,17 +691,511 @@ class XASAnalysisTab(tk.Frame):
                            command=self._redraw_xanes,
                            font=("", 8)).pack(anchor="w", pady=1)
 
+        lbl("\u2500\u2500 View Box \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+        self._xanes_xmin_var = tk.StringVar(value="")
+        self._xanes_xmax_var = tk.StringVar(value="")
+        self._xanes_ymin_var = tk.StringVar(value="")
+        self._xanes_ymax_var = tk.StringVar(value="")
+
+        f_vx1 = tk.Frame(pf); f_vx1.pack(fill=tk.X, pady=1)
+        tk.Label(f_vx1, text="X min:", width=14, anchor="w",
+                 font=("", 8)).pack(side=tk.LEFT)
+        ttk.Entry(f_vx1, textvariable=self._xanes_xmin_var,
+                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+
+        f_vx2 = tk.Frame(pf); f_vx2.pack(fill=tk.X, pady=1)
+        tk.Label(f_vx2, text="X max:", width=14, anchor="w",
+                 font=("", 8)).pack(side=tk.LEFT)
+        ttk.Entry(f_vx2, textvariable=self._xanes_xmax_var,
+                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+
+        f_vy1 = tk.Frame(pf); f_vy1.pack(fill=tk.X, pady=1)
+        tk.Label(f_vy1, text="Y min:", width=14, anchor="w",
+                 font=("", 8)).pack(side=tk.LEFT)
+        ttk.Entry(f_vy1, textvariable=self._xanes_ymin_var,
+                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+
+        f_vy2 = tk.Frame(pf); f_vy2.pack(fill=tk.X, pady=1)
+        tk.Label(f_vy2, text="Y max:", width=14, anchor="w",
+                 font=("", 8)).pack(side=tk.LEFT)
+        ttk.Entry(f_vy2, textvariable=self._xanes_ymax_var,
+                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+
+        f_vbtn = tk.Frame(pf); f_vbtn.pack(fill=tk.X, pady=(2, 1))
+        tk.Button(f_vbtn, text="Apply", font=("", 8),
+                  command=self._apply_xanes_view_box).pack(side=tk.LEFT)
+        tk.Button(f_vbtn, text="From Plot", font=("", 8),
+                  command=self._capture_xanes_view_box).pack(side=tk.LEFT, padx=4)
+        tk.Button(f_vbtn, text="Auto", font=("", 8),
+                  command=self._reset_xanes_view_box).pack(side=tk.LEFT)
+
+        lbl("\u2500\u2500 Processing \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+        self._deglitch_sigma_var = tk.DoubleVar(value=6.0)
+        self._deglitch_window_var = tk.IntVar(value=7)
+        row("Glitch \u03c3:", self._deglitch_sigma_var, 2.0, 15.0, 0.5, "%.1f")
+        row("Median pts:", self._deglitch_window_var, 3, 31, 2, "%.0f")
+        f_deg = tk.Frame(pf); f_deg.pack(fill=tk.X, pady=(2, 1))
+        tk.Button(f_deg, text="Auto Deglitch", font=("", 8),
+                  command=self._auto_deglitch_current).pack(side=tk.LEFT)
+        tk.Button(f_deg, text="Reset Scan", font=("", 8),
+                  command=self._reset_current_scan_processing).pack(side=tk.LEFT, padx=4)
+
+        self._smooth_window_var = tk.IntVar(value=7)
+        self._smooth_poly_var = tk.IntVar(value=3)
+        row("Smooth pts:", self._smooth_window_var, 5, 51, 2, "%.0f")
+        row("Poly order:", self._smooth_poly_var, 2, 5, 1, "%.0f")
+        f_smooth = tk.Frame(pf); f_smooth.pack(fill=tk.X, pady=(2, 1))
+        tk.Button(f_smooth, text="Smooth Scan", font=("", 8),
+                  command=self._smooth_current_scan).pack(side=tk.LEFT)
+
+        self._energy_shift_var = tk.DoubleVar(value=0.0)
+        row("Shift E (eV):", self._energy_shift_var, -20.0, 20.0, 0.1, "%.1f")
+        f_shift = tk.Frame(pf); f_shift.pack(fill=tk.X, pady=(2, 1))
+        tk.Button(f_shift, text="Shift Energy", font=("", 8),
+                  command=self._shift_current_scan_energy).pack(side=tk.LEFT)
+
         tk.Checkbutton(pf, text="Show FT window on \u03c7(k)",
                        variable=self._show_win_var,
                        font=("", 8)).pack(anchor="w", pady=1)
 
     def _update_show_section_visibility(self):
-        """Show 'Show on XANES plot' section only when exactly 1 scan is visible."""
-        n_visible = len(self._selected_labels)
-        if n_visible <= 1:
+        """Keep the XANES display toggles visible.
+
+        The XAS Analysis tab auto-selects all loaded scans on entry, so hiding
+        this section when multiple scans are visible makes the controls appear
+        to vanish during normal use.
+        """
+        if not self._show_section_frame.winfo_manager():
             self._show_section_frame.pack(fill=tk.X)
+
+    def _parse_view_limit(self, value: str) -> Optional[float]:
+        value = str(value).strip()
+        if not value:
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            return None
+
+    def _format_view_limit(self, value: float) -> str:
+        return f"{value:.3f}".rstrip("0").rstrip(".")
+
+    def _apply_xanes_view_limits(self):
+        xmin = self._parse_view_limit(self._xanes_xmin_var.get())
+        xmax = self._parse_view_limit(self._xanes_xmax_var.get())
+        ymin = self._parse_view_limit(self._xanes_ymin_var.get())
+        ymax = self._parse_view_limit(self._xanes_ymax_var.get())
+
+        if xmin is not None and xmax is not None and xmin >= xmax:
+            self._status_lbl.config(text="XANES view box: X min must be < X max.",
+                                    fg="#993300")
+            return
+        if ymin is not None and ymax is not None and ymin >= ymax:
+            self._status_lbl.config(text="XANES view box: Y min must be < Y max.",
+                                    fg="#993300")
+            return
+
+        if xmin is not None or xmax is not None:
+            self._ax_mu.set_xlim(left=xmin, right=xmax)
+        if ymin is not None or ymax is not None:
+            self._ax_mu.set_ylim(bottom=ymin, top=ymax)
+
+    def _apply_xanes_view_box(self):
+        self._redraw_xanes()
+        self._status_lbl.config(text="Applied XANES view box.", fg="#003366")
+
+    def _capture_xanes_view_box(self):
+        xmin, xmax = self._ax_mu.get_xlim()
+        ymin, ymax = self._ax_mu.get_ylim()
+        self._xanes_xmin_var.set(self._format_view_limit(xmin))
+        self._xanes_xmax_var.set(self._format_view_limit(xmax))
+        self._xanes_ymin_var.set(self._format_view_limit(ymin))
+        self._xanes_ymax_var.set(self._format_view_limit(ymax))
+        self._status_lbl.config(text="Captured current XANES plot limits.",
+                                fg="#003366")
+
+    def _reset_xanes_view_box(self):
+        self._xanes_xmin_var.set("")
+        self._xanes_xmax_var.set("")
+        self._xanes_ymin_var.set("")
+        self._xanes_ymax_var.set("")
+        self._redraw_xanes()
+        self._status_lbl.config(text="Reset XANES view box to auto.",
+                                fg="gray")
+
+    def _ensure_scan_backup(self, scan) -> None:
+        meta = getattr(scan, "metadata", None)
+        if meta is None:
+            scan.metadata = {}
+            meta = scan.metadata
+        if "_binah_original_energy" not in meta:
+            meta["_binah_original_energy"] = scan.energy_ev.copy()
+            meta["_binah_original_mu"] = scan.mu.copy()
+            meta["_binah_original_e0"] = float(scan.e0)
+            meta["_binah_original_norm"] = bool(scan.is_normalized)
+
+    def _restore_scan_backup(self, scan) -> bool:
+        self._ensure_scan_backup(scan)
+        meta = scan.metadata
+        if "_binah_original_energy" not in meta or "_binah_original_mu" not in meta:
+            return False
+        scan.energy_ev = np.array(meta["_binah_original_energy"], dtype=float).copy()
+        scan.mu = np.array(meta["_binah_original_mu"], dtype=float).copy()
+        scan.e0 = float(meta.get("_binah_original_e0", 0.0))
+        scan.is_normalized = bool(meta.get("_binah_original_norm", scan.is_normalized))
+        return True
+
+    def _odd_int(self, value, minimum: int = 3) -> int:
+        out = max(minimum, int(round(float(value))))
+        if out % 2 == 0:
+            out += 1
+        return out
+
+    def _get_current_scan(self):
+        label = self._scan_var.get()
+        if not label:
+            self._status_lbl.config(text="Select a scan first.", fg="#993300")
+            return None, None
+        scan = self._get_scan_by_label(label)
+        if scan is None:
+            self._status_lbl.config(text="Scan not found. Click \u21bb Refresh.",
+                                    fg="#993300")
+            return label, None
+        self._ensure_scan_backup(scan)
+        return label, scan
+
+    def _refresh_after_processing_change(self, focus_label: Optional[str] = None) -> None:
+        current = focus_label or self._scan_var.get()
+        self._results.clear()
+
+        # Keep only labels that still exist.
+        self._selected_labels = [
+            lbl for lbl in self._selected_labels
+            if self._get_scan_by_label(lbl) is not None
+        ]
+
+        rerun_labels = list(self._selected_labels)
+        if current and not rerun_labels and self._get_scan_by_label(current) is not None:
+            rerun_labels.append(current)
+            if current not in self._selected_labels:
+                self._selected_labels.append(current)
+            if current not in self._scan_vis_vars:
+                self._scan_vis_vars[current] = tk.BooleanVar(value=True)
+            self._scan_vis_vars[current].set(True)
+
+        self._rebuild_scan_list_rows()
+
+        if current:
+            self._scan_var.set(current)
+            self._auto_fill_e0()
+
+        for label in rerun_labels:
+            scan = self._get_scan_by_label(label)
+            if scan is not None:
+                self._run_single(label, scan)
+
+        if rerun_labels:
+            self._redraw()
         else:
-            self._show_section_frame.pack_forget()
+            self._draw_empty_xanes()
+            self._draw_empty_exafs()
+            if self._replot_fn is not None:
+                self._replot_fn()
+
+    def _deglitch_scan_arrays(self, energy: np.ndarray, mu: np.ndarray,
+                              sigma: float, window_pts: int):
+        if len(mu) < 5:
+            return mu.copy(), np.zeros(len(mu), dtype=bool)
+
+        kernel = min(self._odd_int(window_pts, minimum=3), len(mu) if len(mu) % 2 == 1 else len(mu) - 1)
+        if kernel < 3:
+            return mu.copy(), np.zeros(len(mu), dtype=bool)
+
+        baseline = median_filter(mu, size=kernel, mode="nearest")
+        resid = mu - baseline
+        resid_med = float(np.median(resid))
+        mad = float(np.median(np.abs(resid - resid_med)))
+        scale = 1.4826 * mad
+        if scale <= 1e-12:
+            scale = float(np.std(resid))
+        if scale <= 1e-12:
+            return mu.copy(), np.zeros(len(mu), dtype=bool)
+
+        glitch_mask = np.abs(resid - resid_med) > max(float(sigma), 0.5) * scale
+        if glitch_mask.sum() == 0:
+            return mu.copy(), glitch_mask
+
+        good = ~glitch_mask
+        if good.sum() < 2:
+            return mu.copy(), np.zeros(len(mu), dtype=bool)
+
+        mu_fixed = mu.copy()
+        mu_fixed[glitch_mask] = np.interp(energy[glitch_mask], energy[good], mu[good])
+        return mu_fixed, glitch_mask
+
+    def _auto_deglitch_current(self):
+        label, scan = self._get_current_scan()
+        if scan is None:
+            return
+
+        sigma = float(self._deglitch_sigma_var.get())
+        window_pts = int(self._deglitch_window_var.get())
+        mu_new, glitch_mask = self._deglitch_scan_arrays(
+            scan.energy_ev, scan.mu, sigma=sigma, window_pts=window_pts)
+
+        n_glitch = int(np.count_nonzero(glitch_mask))
+        if n_glitch == 0:
+            self._status_lbl.config(
+                text=f"No glitches detected for {label}. Try a lower \u03c3 threshold.",
+                fg="gray")
+            return
+
+        scan.mu = mu_new
+        self._refresh_after_processing_change(label)
+        self._status_lbl.config(
+            text=f"Deglitched {label}: replaced {n_glitch} point(s).",
+            fg="#003366")
+
+    def _smooth_current_scan(self):
+        label, scan = self._get_current_scan()
+        if scan is None:
+            return
+
+        npts = len(scan.mu)
+        if npts < 5:
+            self._status_lbl.config(text="Not enough data points to smooth.",
+                                    fg="#993300")
+            return
+
+        window = min(self._odd_int(self._smooth_window_var.get(), minimum=5),
+                     npts if npts % 2 == 1 else npts - 1)
+        poly = max(1, min(int(self._smooth_poly_var.get()), window - 1))
+        if window < 5 or window <= poly:
+            self._status_lbl.config(text="Smooth settings are not valid for this scan.",
+                                    fg="#993300")
+            return
+
+        scan.mu = savgol_filter(scan.mu, window_length=window,
+                                polyorder=poly, mode="interp")
+        self._refresh_after_processing_change(label)
+        self._status_lbl.config(
+            text=f"Smoothed {label} with Savitzky-Golay ({window} pts, poly {poly}).",
+            fg="#003366")
+
+    def _shift_current_scan_energy(self):
+        label, scan = self._get_current_scan()
+        if scan is None:
+            return
+
+        shift = float(self._energy_shift_var.get())
+        if abs(shift) < 1e-12:
+            self._status_lbl.config(text="Energy shift is 0.0 eV; nothing changed.",
+                                    fg="gray")
+            return
+
+        meta = getattr(scan, "metadata", {}) or {}
+        link_group = meta.get("_binah_link_group")
+        linked_scans = []
+        if link_group:
+            for other_label, other_scan, *_ in self._get_scans():
+                other_meta = getattr(other_scan, "metadata", {}) or {}
+                if other_meta.get("_binah_link_group") == link_group:
+                    linked_scans.append((other_label, other_scan))
+        else:
+            linked_scans.append((label, scan))
+
+        moved = 0
+        for _lbl, _scan in linked_scans:
+            _scan.energy_ev = _scan.energy_ev + shift
+            if _scan.e0:
+                _scan.e0 = float(_scan.e0 + shift)
+            moved += 1
+
+        self._refresh_after_processing_change(label)
+        if moved > 1:
+            self._status_lbl.config(
+                text=f"Shifted {label} and {moved - 1} linked scan(s) by {shift:.2f} eV.",
+                fg="#003366")
+        else:
+            self._status_lbl.config(
+                text=f"Shifted {label} by {shift:.2f} eV.",
+                fg="#003366")
+
+    def _reset_current_scan_processing(self):
+        label, scan = self._get_current_scan()
+        if scan is None:
+            return
+
+        if not self._restore_scan_backup(scan):
+            self._status_lbl.config(text="No saved original scan state found.",
+                                    fg="#993300")
+            return
+
+        self._refresh_after_processing_change(label)
+        self._status_lbl.config(
+            text=f"Reset {label} to the originally loaded scan.",
+            fg="gray")
+
+    # ── Averaging dialog ─────────────────────────────────────────────────────
+
+    def _open_average_dialog(self):
+        """Open a dialog to select scans for averaging with optional I₂ alignment."""
+        scans = self._get_scans()
+        if not scans:
+            messagebox.showinfo("No Scans", "Load experimental scans first.", parent=self)
+            return
+
+        dlg = tk.Toplevel(self)
+        dlg.title("Average Scans")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.lift()
+
+        # ── Header ──────────────────────────────────────────────────────────
+        hdr = tk.Frame(dlg, bg="#5c1a5c", padx=10, pady=6)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="\u2211  Average XAS Scans", font=("", 11, "bold"),
+                 bg="#5c1a5c", fg="white").pack(side=tk.LEFT)
+
+        body = tk.Frame(dlg, padx=12, pady=8)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # ── Scan checklist ───────────────────────────────────────────────────
+        tk.Label(body, text="Select scans to average:",
+                 font=("", 9, "bold")).grid(row=0, column=0, columnspan=3,
+                                             sticky="w", pady=(0, 4))
+        tk.Label(body, text="Scan", font=("", 8, "bold"), fg="#333",
+                 width=42, anchor="w").grid(row=1, column=0, sticky="w")
+        tk.Label(body, text="Reference", font=("", 8, "bold"),
+                 fg="#333").grid(row=1, column=1, sticky="w", padx=(8, 0))
+
+        check_vars: List[tk.BooleanVar] = []
+        scan_entries = []   # (label, scan) tuples
+
+        scroll_fr = tk.Frame(body)
+        scroll_fr.grid(row=2, column=0, columnspan=3, sticky="nsew", pady=4)
+
+        canvas = tk.Canvas(scroll_fr, width=480, height=min(220, len(scans)*26 + 10),
+                           highlightthickness=0)
+        sb = ttk.Scrollbar(scroll_fr, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        inner = tk.Frame(canvas)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        for label, scan, *_ in scans:
+            var = tk.BooleanVar(value=False)
+            check_vars.append(var)
+            scan_entries.append((label, scan))
+
+            row_fr = tk.Frame(inner)
+            row_fr.pack(fill=tk.X, pady=1)
+
+            tk.Checkbutton(row_fr, variable=var, width=0).pack(side=tk.LEFT)
+            # Colour swatch
+            col = _PALETTE[len(scan_entries) % len(_PALETTE)]
+            tk.Label(row_fr, bg=col, width=2, relief=tk.FLAT).pack(
+                side=tk.LEFT, padx=(0, 4))
+            # Scan label (truncated)
+            short = label[:45] + ("…" if len(label) > 45 else "")
+            tk.Label(row_fr, text=short, font=("", 8), anchor="w",
+                     width=42).pack(side=tk.LEFT)
+            # Reference indicator
+            if scan.has_reference():
+                ref_txt = f"✓ {scan.ref_label}" if scan.ref_label else "✓ ref"
+                ref_fg  = "#005500"
+            else:
+                ref_txt = "—"
+                ref_fg  = "#999999"
+            tk.Label(row_fr, text=ref_txt, font=("", 8), fg=ref_fg,
+                     width=14, anchor="w").pack(side=tk.LEFT, padx=(8, 0))
+
+        # ── Options ─────────────────────────────────────────────────────────
+        opt_fr = tk.Frame(body)
+        opt_fr.grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 2))
+
+        use_ref_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(opt_fr,
+                       text="Use reference channel for energy alignment (I\u2082 / diode)",
+                       variable=use_ref_var,
+                       font=("", 8)).pack(side=tk.LEFT)
+
+        lbl_fr = tk.Frame(body)
+        lbl_fr.grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 2))
+        tk.Label(lbl_fr, text="Output label:", font=("", 8)).pack(side=tk.LEFT)
+        out_label_var = tk.StringVar(value="average")
+        tk.Entry(lbl_fr, textvariable=out_label_var, width=30,
+                 font=("", 8)).pack(side=tk.LEFT, padx=(6, 0))
+
+        info_lbl = tk.Label(body, text="", font=("", 8), fg="#444",
+                            wraplength=460, justify="left")
+        info_lbl.grid(row=5, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        # ── Buttons ─────────────────────────────────────────────────────────
+        btn_fr = tk.Frame(body)
+        btn_fr.grid(row=6, column=0, columnspan=3, pady=(10, 2))
+
+        def _do_average():
+            selected = [(label, scan)
+                        for (label, scan), var in zip(scan_entries, check_vars)
+                        if var.get()]
+            if len(selected) < 2:
+                info_lbl.config(text="⚠ Select at least 2 scans.", fg="#993300")
+                return
+
+            sel_scans = [scan for _, scan in selected]
+            n_ref     = sum(1 for sc in sel_scans if sc.has_reference())
+            use_ref   = use_ref_var.get() and n_ref == len(sel_scans)
+
+            if use_ref_var.get() and n_ref < len(sel_scans):
+                info_lbl.config(
+                    text=(f"⚠ Only {n_ref}/{len(sel_scans)} scans have a reference "
+                          f"channel — averaging without alignment."),
+                    fg="#885500")
+                use_ref = False
+
+            try:
+                averaged = align_and_average_scans(
+                    sel_scans,
+                    use_reference=use_ref,
+                    label=out_label_var.get().strip() or "average",
+                )
+            except Exception as exc:
+                info_lbl.config(text=f"Error: {exc}", fg="red")
+                return
+
+            meta = averaged.metadata
+            shift_str = ""
+            if use_ref and meta.get("shifts_ev"):
+                shifts = meta["shifts_ev"]
+                shift_str = (
+                    f"  |  energy shifts: "
+                    + ", ".join(f"{s:+.2f}" for s in shifts) + " eV"
+                )
+
+            info_lbl.config(
+                text=(f"✓ Averaged {meta['n_averaged']} scans"
+                      + (" with reference alignment" if use_ref else " (no alignment)")
+                      + shift_str),
+                fg="#005500")
+
+            if self._add_scan_fn is not None:
+                self._add_scan_fn(averaged)
+                self.refresh_scan_list()
+                dlg.after(800, dlg.destroy)
+            else:
+                info_lbl.config(
+                    text="Averaged scan created but no add_scan_fn provided.",
+                    fg="#885500")
+
+        tk.Button(btn_fr, text="\u2211  Average & Add to Binah",
+                  bg="#5c1a5c", fg="white", font=("", 9, "bold"),
+                  command=_do_average).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_fr, text="Cancel",
+                  command=dlg.destroy).pack(side=tk.LEFT, padx=4)
 
     def auto_run_all(self):
         """Run analysis on every loaded scan and show them all. Called when tab is opened."""
@@ -715,6 +1219,7 @@ class XASAnalysisTab(tk.Frame):
 
     def _run_single(self, label: str, scan):
         """Run analysis pipeline on one scan without touching the overlay/redraw."""
+        self._ensure_scan_backup(scan)
         e0   = self._e0_var.get()
         pre1 = self._pre1_var.get()
         pre2 = self._pre2_var.get()
@@ -933,6 +1438,7 @@ class XASAnalysisTab(tk.Frame):
         self._ax_mu.text(0.5, 0.45, "Load a scan and click  \u25b6  Run Analysis",
                           transform=self._ax_mu.transAxes,
                           ha="center", va="center", fontsize=9, color="lightgray")
+        self._apply_xanes_view_limits()
         if _HAS_SNS:
             sns.despine(ax=self._ax_mu, offset=4)
         self._canvas_xanes.draw_idle()
@@ -960,6 +1466,8 @@ class XASAnalysisTab(tk.Frame):
     def refresh_scan_list(self):
         """Re-populate the scan combobox and scan list panel."""
         scans = self._get_scans()
+        for _label, _scan, *_ in scans:
+            self._ensure_scan_backup(_scan)
         labels = [lbl for lbl, *_ in scans]
         self._scan_cb["values"] = labels
         if labels and self._scan_var.get() not in labels:
@@ -1096,6 +1604,15 @@ class XASAnalysisTab(tk.Frame):
             "context":  self._context_var.get(),
             "show_bkg": self._show_bkg_var.get(),
             "show_win": self._show_win_var.get(),
+            "xanes_xmin": self._xanes_xmin_var.get(),
+            "xanes_xmax": self._xanes_xmax_var.get(),
+            "xanes_ymin": self._xanes_ymin_var.get(),
+            "xanes_ymax": self._xanes_ymax_var.get(),
+            "deglitch_sigma": self._deglitch_sigma_var.get(),
+            "deglitch_window": self._deglitch_window_var.get(),
+            "smooth_window": self._smooth_window_var.get(),
+            "smooth_poly": self._smooth_poly_var.get(),
+            "energy_shift": self._energy_shift_var.get(),
         }
 
     def set_params(self, d: dict) -> None:
@@ -1127,6 +1644,19 @@ class XASAnalysisTab(tk.Frame):
             self._show_bkg_var.set(bool(d["show_bkg"]))
         if "show_win" in d:
             self._show_win_var.set(bool(d["show_win"]))
+        if "xanes_xmin" in d:
+            self._xanes_xmin_var.set(str(d["xanes_xmin"]))
+        if "xanes_xmax" in d:
+            self._xanes_xmax_var.set(str(d["xanes_xmax"]))
+        if "xanes_ymin" in d:
+            self._xanes_ymin_var.set(str(d["xanes_ymin"]))
+        if "xanes_ymax" in d:
+            self._xanes_ymax_var.set(str(d["xanes_ymax"]))
+        _s(self._deglitch_sigma_var, "deglitch_sigma")
+        _s(self._deglitch_window_var, "deglitch_window", int)
+        _s(self._smooth_window_var, "smooth_window", int)
+        _s(self._smooth_poly_var, "smooth_poly", int)
+        _s(self._energy_shift_var, "energy_shift")
 
     # ── Apply normalisation to every loaded scan ──────────────────────────────
 
@@ -1150,6 +1680,7 @@ class XASAnalysisTab(tk.Frame):
         fail = 0
 
         for lbl, scan, *_ in scans_raw:
+            self._ensure_scan_backup(scan)
             energy = scan.energy_ev
             # Use stored e0 as starting point; override only if UI value looks
             # reasonable for this scan (within ±50 eV of stored edge energy).
@@ -1224,6 +1755,7 @@ class XASAnalysisTab(tk.Frame):
             self._status_lbl.config(
                 text="Scan not found. Click \u21bb Refresh.", fg="red")
             return
+        self._ensure_scan_backup(scan)
 
         e0   = self._e0_var.get()
         pre1 = self._pre1_var.get()
@@ -1448,6 +1980,7 @@ class XASAnalysisTab(tk.Frame):
         ax.set_title("\u03bc(E)  \u2014  XANES", fontsize=9, loc="left", pad=3)
         ax.tick_params(labelsize=7)
         ax.xaxis.set_minor_locator(mticker.AutoMinorLocator())
+        self._apply_xanes_view_limits()
 
         if self._selected_labels:
             ax.legend(fontsize=7, loc="lower right", framealpha=0.8)

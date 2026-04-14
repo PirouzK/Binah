@@ -37,3 +37,6 @@ $RECYCLE.BIN/
 .idea/
 *.sublime-project
 *.sublime-workspace
+
+# Local upstream checkout used to vendor sgmanalysis into this repo
+SGMPython/

@@ -46,9 +46,17 @@ class ExperimentalScan:
     is_normalized: bool = True
     scan_type: str = ""      # "fluorescence", "transmission", "pre-normalized", "raw"
     metadata: Dict = field(default_factory=dict)
+    # Simultaneously-measured reference channel (e.g. I₂ gas cell, diode).
+    # None when the data file carries no reference signal.
+    ref_energy_ev: np.ndarray = field(default=None)
+    ref_mu: np.ndarray = field(default=None)
+    ref_label: str = ""      # e.g. "I2", "PD", "DiodeDetector"
 
     def display_name(self) -> str:
         return self.label or os.path.basename(self.source_file)
+
+    def has_reference(self) -> bool:
+        return self.ref_mu is not None and len(self.ref_mu) > 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -501,6 +509,28 @@ class ExperimentalParser:
             i_fluor = _col(["ClKa1", "SKa1", "PKa1", "NiKa1", "TiKa1",
                              "FeKa1", "CuKa1", "ZnKa1", "MnKa1"])
 
+        # Reference channel: I₂ gas cell or photodiode placed after sample.
+        # Priority: explicit I2 column → diode/PD → transmission channel.
+        # The reference name is stored alongside the signal for energy alignment.
+        _ref_candidates = [
+            # Explicit I2 names (case-insensitive match via _col)
+            ["I2Detector", "I_2", "I2"],
+            # Photodiode / transmission diode
+            ["PDDetector", "DiodePHDetector", "DiodeDetector", "PhotoDiode", "PD"],
+            # Generic "reference" keyword
+            ["reference", "ReferenceDetector", "RefDetector"],
+            # Transmission detector (In / It)
+            ["It", "Itrans", "I_t"],
+        ]
+        i_ref      = None
+        ref_label  = ""
+        for candidates in _ref_candidates:
+            idx = _col(candidates)
+            if idx is not None and idx != i_energy and idx != i_i0:
+                i_ref     = idx
+                ref_label = col_names[idx]
+                break
+
         if i_energy is None:
             raise ValueError("Could not find energy column in SXRMB file.")
 
@@ -525,53 +555,55 @@ class ExperimentalParser:
             sig = sig - sig.min()
             return sig
 
+        # Build reference arrays once (shared by all scans from this file)
+        if i_ref is not None:
+            ref_sig = _norm_signal(i_ref, i_i0)
+        else:
+            ref_sig = None
+
+        def _make_scan(label, mu, scan_type):
+            return ExperimentalScan(
+                label=label, source_file=filepath,
+                energy_ev=energy.copy(), mu=mu,
+                e0=0.0, is_normalized=False,
+                scan_type=scan_type,
+                ref_energy_ev=energy.copy() if ref_sig is not None else None,
+                ref_mu=ref_sig.copy() if ref_sig is not None else None,
+                ref_label=ref_label,
+            )
+
         results = []
 
         # TEY scan
         if signal in ("auto", "tey", "both") and i_tey is not None:
             tey_col = col_names[i_tey]
             if "norm_" in tey_col.lower():
-                mu_tey = data[:, i_tey]
+                mu_tey = data[:, i_tey].copy()
             else:
                 mu_tey = _norm_signal(i_tey, i_i0)
             mu_tey = mu_tey - mu_tey.min()
             lbl = f"{basename}  TEY"
             if edge_str:
                 lbl += f"  ({edge_str})"
-            results.append(ExperimentalScan(
-                label=lbl, source_file=filepath,
-                energy_ev=energy, mu=mu_tey,
-                e0=0.0, is_normalized=False,
-                scan_type="SXRMB TEY",
-            ))
+            results.append(_make_scan(lbl, mu_tey, "SXRMB TEY"))
 
         # Fluorescence scan
         if signal in ("auto", "fluor", "both") and i_fluor is not None:
             fluor_col = col_names[i_fluor]
             if "norm_" in fluor_col.lower():
-                mu_fl = data[:, i_fluor]
+                mu_fl = data[:, i_fluor].copy()
             else:
                 mu_fl = _norm_signal(i_fluor, i_i0)
             mu_fl = mu_fl - mu_fl.min()
             lbl = f"{basename}  Fluor ({fluor_col})"
             if edge_str:
                 lbl += f"  ({edge_str})"
-            results.append(ExperimentalScan(
-                label=lbl, source_file=filepath,
-                energy_ev=energy, mu=mu_fl,
-                e0=0.0, is_normalized=False,
-                scan_type="SXRMB Fluorescence",
-            ))
+            results.append(_make_scan(lbl, mu_fl, "SXRMB Fluorescence"))
 
         # Fallback: auto picked neither
         if not results and signal == "auto" and i_tey is not None:
             mu_tey = _norm_signal(i_tey, i_i0)
-            results.append(ExperimentalScan(
-                label=f"{basename}  TEY", source_file=filepath,
-                energy_ev=energy, mu=mu_tey,
-                e0=0.0, is_normalized=False,
-                scan_type="SXRMB TEY",
-            ))
+            results.append(_make_scan(f"{basename}  TEY", mu_tey, "SXRMB TEY"))
 
         if not results:
             raise ValueError(
@@ -851,3 +883,139 @@ class ExperimentalParser:
         if required:
             raise ValueError(f"Required column not found. Keywords tried: {keywords}")
         return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Scan averaging with optional reference-based energy alignment
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_e0_simple(energy: np.ndarray, mu: np.ndarray) -> float:
+    """Return the energy of the max first derivative (simple E0 finder)."""
+    if len(energy) < 4:
+        return float(energy[len(energy) // 2])
+    grad = np.gradient(mu, energy)
+    lo, hi = len(energy) // 10, len(energy) * 9 // 10
+    return float(energy[lo + int(np.argmax(np.abs(grad[lo:hi])))])
+
+
+def align_and_average_scans(
+    scans: List[ExperimentalScan],
+    use_reference: bool = True,
+    label: str = "",
+) -> ExperimentalScan:
+    """
+    Align multiple scans (optionally via their reference channel) and average.
+
+    Alignment algorithm (reference-based)
+    ──────────────────────────────────────
+    For each scan i, find the inflection point of its reference spectrum:
+        E0_ref_i  = argmax |dμ_ref/dE|
+    Compute shift relative to scan 0:
+        ΔE_i = E0_ref_0 − E0_ref_i
+    Apply shift to the main energy axis:
+        energy_i_aligned = energy_i + ΔE_i
+
+    Without reference (or if any scan is missing one), no shift is applied —
+    scans are assumed to be on the same energy axis already.
+
+    Averaging
+    ─────────
+    1. Find the intersection energy range across all (aligned) scans.
+    2. Use the finest energy step among all scans for the common grid.
+    3. Linearly interpolate each scan onto the common grid.
+    4. Average: μ_avg(E) = mean_i [ interp(μ_i, E) ]
+
+    Returns
+    ───────
+    A new ExperimentalScan whose .ref_mu is the averaged reference (if present).
+    The .metadata dict contains 'n_averaged', 'shifts_ev', 'ref_e0s'.
+    """
+    if not scans:
+        raise ValueError("No scans provided to average.")
+    if len(scans) == 1:
+        sc = scans[0]
+        out = ExperimentalScan(
+            label=label or f"{sc.label} (avg n=1)",
+            source_file=sc.source_file,
+            energy_ev=sc.energy_ev.copy(),
+            mu=sc.mu.copy(),
+            e0=sc.e0,
+            is_normalized=sc.is_normalized,
+            scan_type=sc.scan_type,
+            ref_energy_ev=sc.ref_energy_ev.copy() if sc.ref_energy_ev is not None else None,
+            ref_mu=sc.ref_mu.copy() if sc.ref_mu is not None else None,
+            ref_label=sc.ref_label,
+            metadata={"n_averaged": 1, "shifts_ev": [0.0], "ref_e0s": []},
+        )
+        return out
+
+    # ── Step 1: compute energy shifts from reference ──────────────────────────
+    shifts = [0.0] * len(scans)
+    ref_e0s: List[float] = []
+    all_have_ref = use_reference and all(s.has_reference() for s in scans)
+
+    if all_have_ref:
+        # Find E0 of each scan's reference spectrum
+        for sc in scans:
+            ref_e0s.append(_find_e0_simple(sc.ref_energy_ev, sc.ref_mu))
+        # Shift each scan so its reference E0 matches scan-0's reference E0
+        anchor = ref_e0s[0]
+        shifts = [anchor - e for e in ref_e0s]   # ΔE_i = E0_ref_0 − E0_ref_i
+
+    # ── Step 2: build shifted energy arrays ───────────────────────────────────
+    shifted_energies = [sc.energy_ev + sh for sc, sh in zip(scans, shifts)]
+
+    # ── Step 3: common energy grid (intersection range, finest step) ──────────
+    e_min = max(e[0]  for e in shifted_energies)
+    e_max = min(e[-1] for e in shifted_energies)
+    if e_max <= e_min:
+        # Fallback to union if intersection is empty
+        e_min = min(e[0]  for e in shifted_energies)
+        e_max = max(e[-1] for e in shifted_energies)
+
+    steps = [float(np.min(np.diff(e))) for e in shifted_energies if len(e) > 1]
+    step  = min(steps) if steps else 0.1
+    grid  = np.arange(e_min, e_max + step * 0.5, step)
+
+    # ── Step 4: interpolate and average μ ────────────────────────────────────
+    interp_mu = [np.interp(grid, e, sc.mu) for e, sc in zip(shifted_energies, scans)]
+    avg_mu    = np.mean(interp_mu, axis=0)
+
+    # ── Step 5: average reference spectra (if all present) ───────────────────
+    avg_ref_mu = None
+    avg_ref_en = None
+    if all_have_ref:
+        shifted_ref_en = [sc.ref_energy_ev + sh
+                          for sc, sh in zip(scans, shifts)]
+        ref_e_min = max(e[0]  for e in shifted_ref_en)
+        ref_e_max = min(e[-1] for e in shifted_ref_en)
+        if ref_e_max > ref_e_min:
+            ref_steps = [float(np.min(np.diff(e)))
+                         for e in shifted_ref_en if len(e) > 1]
+            ref_step  = min(ref_steps) if ref_steps else step
+            ref_grid  = np.arange(ref_e_min, ref_e_max + ref_step * 0.5, ref_step)
+            interp_ref = [np.interp(ref_grid, e, sc.ref_mu)
+                          for e, sc in zip(shifted_ref_en, scans)]
+            avg_ref_mu = np.mean(interp_ref, axis=0)
+            avg_ref_en = ref_grid
+
+    lbl = label or f"{scans[0].label} (avg n={len(scans)})"
+    return ExperimentalScan(
+        label=lbl,
+        source_file=scans[0].source_file,
+        energy_ev=grid,
+        mu=avg_mu,
+        e0=scans[0].e0,
+        is_normalized=scans[0].is_normalized,
+        scan_type=scans[0].scan_type,
+        ref_energy_ev=avg_ref_en,
+        ref_mu=avg_ref_mu,
+        ref_label=scans[0].ref_label if all_have_ref else "",
+        metadata={
+            "n_averaged":  len(scans),
+            "source_labels": [s.label for s in scans],
+            "shifts_ev":   [round(sh, 4) for sh in shifts],
+            "ref_e0s":     [round(e, 2) for e in ref_e0s],
+            "aligned_by_reference": all_have_ref,
+        },
+    )
