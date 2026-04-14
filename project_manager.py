@@ -61,6 +61,7 @@ def save_project(path: str, app) -> None:
     """Collect all application state and write to a gzip-JSON .otproj file."""
     plot = app._plot
     xas  = app._xas_tab
+    exafs = getattr(app, "_exafs_tab", None)
 
     # ── 1. Loaded ORCA files ─────────────────────────────────────────────────
     orca_files = []
@@ -146,6 +147,7 @@ def save_project(path: str, app) -> None:
 
     # ── 5. XAS analysis params ───────────────────────────────────────────────
     xas_params = xas.get_params()
+    exafs_params = exafs.get_params() if exafs is not None else {}
 
     doc: dict = {
         "version":    1,
@@ -154,6 +156,7 @@ def save_project(path: str, app) -> None:
         "overlays":   overlays,
         "plot_state": plot_state,
         "xas_params": xas_params,
+        "exafs_params": exafs_params,
     }
 
     data = json.dumps(doc, indent=2).encode("utf-8")
@@ -181,6 +184,7 @@ def restore_project(doc: dict, app) -> list:
     warnings = []
     plot = app._plot
     xas  = app._xas_tab
+    exafs = getattr(app, "_exafs_tab", None)
     version = doc.get("version", 1)
 
     # ── 1. Clear existing state ──────────────────────────────────────────────
@@ -259,10 +263,16 @@ def restore_project(doc: dict, app) -> list:
     if xp:
         xas.set_params(xp)
 
+    ep = doc.get("exafs_params", {})
+    if ep and exafs is not None:
+        exafs.set_params(ep)
+
     # ── 7. Refresh UI ────────────────────────────────────────────────────────
     plot._refresh_panel_content()
     plot._replot()
     xas.refresh_scan_list()
+    if exafs is not None:
+        exafs.refresh_scan_list()
 
     return warnings
 
