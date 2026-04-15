@@ -1970,9 +1970,12 @@ class PlotWidget(tk.Frame):
                         ylabel = ("Rel. Intensity" if active_exp else "Oscillator Strength (f)")
 
                     if self._show_sticks.get():
+                        # Only label sticks when no envelope is shown; the
+                        # envelope is the authoritative legend entry otherwise.
+                        _stk_lbl = comp_lbl if not self._show_env.get() else None
                         ml, sl, bl = self.ax.stem(
                             x_arr, yp, linefmt=col_c, markerfmt="o", basefmt=" ",
-                            label=comp_lbl
+                            label=_stk_lbl
                         )
                         ml.set_markersize(st["stick_markersize"] if st.get("stick_markers", True) else 0)
                         ml.set_color(col_c)
@@ -2021,9 +2024,12 @@ class PlotWidget(tk.Frame):
                         ylabel = "Rotatory Strength" if is_cd else "Oscillator Strength (f)"
 
                 if self._show_sticks.get():
+                    # Suppress sticks legend entry when the envelope is also
+                    # drawn — the envelope carries the single legend label.
+                    _stk_lbl = (name if multi_tddft else None) if not self._show_env.get() else None
                     ml, sl, bl = self.ax.stem(
                         x_arr, y_plot, linefmt=colour, markerfmt="o", basefmt=" ",
-                        label=name if multi_tddft else None
+                        label=_stk_lbl
                     )
                     ml.set_markersize(st["stick_markersize"] if st.get("stick_markers", True) else 0)
                     ml.set_color(colour)
@@ -2280,7 +2286,9 @@ class PlotWidget(tk.Frame):
         fn      = gaussian if self._broadening.get() == "Gaussian" else lorentzian
         env     = sum(y * fn(ev_grid, c, fwhm_ev) for c, y in zip(ev_arr, y_arr))
         x_grid  = self._ev_to_unit(ev_grid)
-        label   = f"{name} (env)" if multi else "Envelope"
+        # No "(env)" suffix — the envelope is now the single legend entry per
+        # overlay; the sticks are unlabelled when both are shown together.
+        label   = name if multi else "Envelope"
         st      = self._tddft_style
 
         self.ax.plot(x_grid, env, color=colour, linewidth=st["env_linewidth"],
