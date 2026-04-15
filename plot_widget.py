@@ -4,6 +4,8 @@ Supports single-spectrum view, multi-spectrum TDDFT overlay, and experimental
 XAS scan overlay on a twin axis with ΔE energy-shift alignment.
 """
 
+import json
+import pathlib
 import numpy as np
 import matplotlib
 matplotlib.use("TkAgg")
@@ -15,6 +17,46 @@ from typing import List, Optional, Tuple
 
 from orca_parser import TDDFTSpectrum
 from experimental_parser import ExperimentalScan
+
+# ── Persistent font defaults ──────────────────────────────────────────────────
+# Settings are saved to binah_settings.json next to this file.
+# These values are the factory fallback used when no settings file exists.
+_SETTINGS_FILE = pathlib.Path(__file__).with_name("binah_settings.json")
+
+_FONT_FACTORY_DEFAULTS: dict = {
+    "title_size":  11,   "title_bold":  True,
+    "xlabel_size": 15,   "xlabel_bold": True,
+    "ylabel_size": 15,   "ylabel_bold": True,
+    "tick_size":   12,
+    "legend_size": 14,
+}
+
+
+def _load_font_defaults() -> dict:
+    """Return font defaults from the settings file, falling back to factory."""
+    defaults = dict(_FONT_FACTORY_DEFAULTS)
+    try:
+        if _SETTINGS_FILE.exists():
+            data = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+            for k in defaults:
+                if k in data.get("font", {}):
+                    defaults[k] = data["font"][k]
+    except Exception:
+        pass
+    return defaults
+
+
+def _save_font_defaults(d: dict) -> None:
+    """Persist font defaults to the settings file (merges with existing data)."""
+    try:
+        existing: dict = {}
+        if _SETTINGS_FILE.exists():
+            existing = json.loads(_SETTINGS_FILE.read_text(encoding="utf-8"))
+        existing["font"] = d
+        _SETTINGS_FILE.write_text(
+            json.dumps(existing, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"[binah] Could not save font settings: {exc}")
 
 
 # ── Broadening functions ──────────────────────────────────────────────────────
@@ -253,14 +295,16 @@ class PlotWidget(tk.Frame):
         self._yleft_hi = tk.StringVar(value="")
 
         # Font controls — sizes and bold toggles for each text element
-        self._font_title_size   = tk.IntVar(value=11)
-        self._font_title_bold   = tk.BooleanVar(value=True)
-        self._font_xlabel_size  = tk.IntVar(value=11)
-        self._font_xlabel_bold  = tk.BooleanVar(value=False)
-        self._font_ylabel_size  = tk.IntVar(value=11)
-        self._font_ylabel_bold  = tk.BooleanVar(value=False)
-        self._font_tick_size    = tk.IntVar(value=9)
-        self._font_legend_size  = tk.IntVar(value=9)
+        # Initialised from the user's saved defaults (or factory fallback).
+        _fd = _load_font_defaults()
+        self._font_title_size   = tk.IntVar(value=_fd["title_size"])
+        self._font_title_bold   = tk.BooleanVar(value=_fd["title_bold"])
+        self._font_xlabel_size  = tk.IntVar(value=_fd["xlabel_size"])
+        self._font_xlabel_bold  = tk.BooleanVar(value=_fd["xlabel_bold"])
+        self._font_ylabel_size  = tk.IntVar(value=_fd["ylabel_size"])
+        self._font_ylabel_bold  = tk.BooleanVar(value=_fd["ylabel_bold"])
+        self._font_tick_size    = tk.IntVar(value=_fd["tick_size"])
+        self._font_legend_size  = tk.IntVar(value=_fd["legend_size"])
 
         # Y-axis label visibility + custom text overrides
         # Empty string = use the auto-computed label; non-empty = use the override.
@@ -1137,23 +1181,64 @@ class PlotWidget(tk.Frame):
         ttk.Separator(frm, orient=tk.HORIZONTAL).grid(
             row=7, column=0, columnspan=4, sticky="ew", pady=(10, 6))
 
+        status_var = tk.StringVar(value="Changes apply live.  Size range 5 – 36 pt.")
+
         def _reset_all():
-            self._font_title_size.set(11);  self._font_title_bold.set(True)
-            self._font_xlabel_size.set(11); self._font_xlabel_bold.set(False)
-            self._font_ylabel_size.set(11); self._font_ylabel_bold.set(False)
-            self._font_tick_size.set(9)
-            self._font_legend_size.set(9)
+            """Reset to the user's saved defaults (or factory if none saved)."""
+            fd = _load_font_defaults()
+            self._font_title_size.set(fd["title_size"])
+            self._font_title_bold.set(fd["title_bold"])
+            self._font_xlabel_size.set(fd["xlabel_size"])
+            self._font_xlabel_bold.set(fd["xlabel_bold"])
+            self._font_ylabel_size.set(fd["ylabel_size"])
+            self._font_ylabel_bold.set(fd["ylabel_bold"])
+            self._font_tick_size.set(fd["tick_size"])
+            self._font_legend_size.set(fd["legend_size"])
             self._replot()
+            status_var.set("Reset to saved defaults.")
+
+        def _save_as_default():
+            """Persist current settings as the new program default."""
+            d = {
+                "title_size":  self._font_title_size.get(),
+                "title_bold":  self._font_title_bold.get(),
+                "xlabel_size": self._font_xlabel_size.get(),
+                "xlabel_bold": self._font_xlabel_bold.get(),
+                "ylabel_size": self._font_ylabel_size.get(),
+                "ylabel_bold": self._font_ylabel_bold.get(),
+                "tick_size":   self._font_tick_size.get(),
+                "legend_size": self._font_legend_size.get(),
+            }
+            _save_font_defaults(d)
+            status_var.set("✔ Saved as program default.")
+
+        def _factory_reset():
+            """Reset to the original factory defaults (ignores saved file)."""
+            fd = _FONT_FACTORY_DEFAULTS
+            self._font_title_size.set(fd["title_size"])
+            self._font_title_bold.set(fd["title_bold"])
+            self._font_xlabel_size.set(fd["xlabel_size"])
+            self._font_xlabel_bold.set(fd["xlabel_bold"])
+            self._font_ylabel_size.set(fd["ylabel_size"])
+            self._font_ylabel_bold.set(fd["ylabel_bold"])
+            self._font_tick_size.set(fd["tick_size"])
+            self._font_legend_size.set(fd["legend_size"])
+            self._replot()
+            status_var.set("Reset to factory defaults.")
 
         btn_row = tk.Frame(frm)
         btn_row.grid(row=8, column=0, columnspan=4, pady=(0, 2))
+        tk.Button(btn_row, text="Save as Default", command=_save_as_default,
+                  font=("", 8, "bold"), bg="#d0e8d0", fg="darkgreen",
+                  relief="raised").pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Reset Defaults", command=_reset_all,
                   font=("", 8)).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="Factory Reset", command=_factory_reset,
+                  font=("", 8), fg="gray").pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Close", command=win.destroy,
                   font=("", 9)).pack(side=tk.LEFT, padx=4)
 
-        tk.Label(frm,
-                 text="Changes apply live. Size range 5 – 36 pt.",
+        tk.Label(frm, textvariable=status_var,
                  font=("", 8), fg="gray").grid(
             row=9, column=0, columnspan=4, pady=(4, 0))
 
