@@ -1035,7 +1035,6 @@ class XASAnalysisTab(tk.Frame):
         self._status_lbl.config(
             text=f"Reset {label} to the originally loaded scan.",
             fg="gray")
-
     # ── Averaging dialog ─────────────────────────────────────────────────────
 
     def _open_average_dialog(self):

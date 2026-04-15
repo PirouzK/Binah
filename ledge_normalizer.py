@@ -9,7 +9,8 @@ Procedure (ref: BlueprintXAS, Delgado-Jaime & DeBeer, 2012):
   3.  Fit the summed raw data *simultaneously* with:
         B(x)    -- four-domain background function
         eL3/eL2 -- cumulative pseudo-Voigt edge steps  (2:1 branching ratio)
-        peaks   -- any number of L3, L2, MLCT, LMCT pseudo-Voigt peaks
+        peaks   -- any number of L3/L2 white-line and edge-resolved
+                   MLCT/LMCT pseudo-Voigt peaks
   4.  Normalize:  mu_norm(E) = ( mu_raw(E) - B(E) ) / ( 3/2 * I_L3,Edge )
   5.  Export normalized spectrum + fit parameters as CSV.
 
@@ -19,7 +20,7 @@ Requires: numpy  scipy  matplotlib   (pip install numpy scipy matplotlib)
 
 import os, sys, csv, threading
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import least_squares, differential_evolution
 from scipy.special import erf
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
@@ -27,6 +28,7 @@ import matplotlib
 matplotlib.use("TkAgg")
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from quanty_seed_export import SUPPORTED_SITE_SYMMETRIES, write_quanty_seed_bundle
 
 # Optional: SGMPython integration for loading directly from SGM stacks.
 # If sgmanalysis is installed (pip install sgmanalysis or local install from
@@ -114,6 +116,8 @@ PARAMS_STATIC = [
     ("b",       "Background", "b    linear in quad domain",   0.0,   -2.0,    2.0, 1e-4,  False),
     ("m4",      "Background", "m4   far post-edge slope",    0.001,  -1.0,    1.0, 1e-4,  False),
     # ── Edge step functions ──────────────────────────────────────────────────
+    ("Eshift",  "Calibration","A    energy shift (eV)",       0.0,    -5.0,    5.0, 0.001, False),
+    ("Escale",  "Calibration","B    energy scale",            1.0,     0.97,   1.03, 1e-4, False),
     ("IL3_Edge","Edge",       "I L3,Edge  step height",       0.5,    0.001,  200.0, 0.01, False),
     ("WL3_Edge","Edge",       "W L3,Edge  FWHM (eV)",         2.0,    0.01,   20.0, 0.1,  False),
     ("GL3_Edge","Edge",       "G L3,Edge  Gauss frac [0-1]",  0.0,    0.0,     1.0, 0.05, False),
@@ -127,36 +131,62 @@ _KEYS_STATIC = [p[0] for p in PARAMS_STATIC]
 # ══════════════════════════════════════════════════════════════════════════════
 PEAK_FIELDS = ['o', 'W', 'I', 'G']
 
+
+def _is_l3_kind(kind):
+    return kind in ('L3', 'L3_MLCT', 'L3_LMCT')
+
+
+def _is_l2_kind(kind):
+    return kind in ('L2', 'L2_MLCT', 'L2_LMCT')
+
 # Static fallback bounds (used by nudge buttons and when E0 is unavailable).
-# Model.bounds() overrides MLCT/LMCT 'o' with dynamic E0-relative constraints.
+# Model.bounds() overrides energy positions with dynamic E0/Tk-relative constraints.
 PEAK_BOUNDS = {
-    'L3':   {'o': (800., 880.), 'W': (0.05, 20.), 'I': (0., 200.), 'G': (0., 1.)},
-    'L2':   {'o': (855., 915.), 'W': (0.05, 20.), 'I': (0., 200.), 'G': (0., 1.)},
-    'MLCT': {'o': (790., 920.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
-    'LMCT': {'o': (845., 915.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
+    'L3_MLCT': {'o': (790., 875.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
+    'L3':      {'o': (800., 880.), 'W': (0.05, 20.), 'I': (0., 200.), 'G': (0., 1.)},
+    'L3_LMCT': {'o': (800., 900.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
+    'L2_MLCT': {'o': (845., 920.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
+    'L2':      {'o': (855., 915.), 'W': (0.05, 20.), 'I': (0., 200.), 'G': (0., 1.)},
+    'L2_LMCT': {'o': (855., 930.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
+    # Legacy generic CT buckets kept for compatibility with older exports.
+    'MLCT':    {'o': (790., 920.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
+    'LMCT':    {'o': (845., 915.), 'W': (0.05, 30.), 'I': (0., 200.), 'G': (0., 1.)},
 }
-# Physical energy ordering:  MLCT (pre-edge / inter-edge) → L3 → LMCT (inter-edge) → L2
+# Physical energy ordering low→high:
+#   L3 MLCT → L3 → L3 LMCT → L2 MLCT → L2 → L2 LMCT
 
 PEAK_PLOT_COLORS = {
-    'L3':   ['#ff8844', '#ffaa66', '#ffcc88', '#ffdd99', '#ffe8bb'],
-    'L2':   ['#ee44aa', '#ff66bb', '#ff88cc', '#ffaadd', '#ffccee'],
-    'MLCT': ['#bb99ff', '#cc88ee', '#ddaaff', '#eeccff', '#f0ddff'],
-    'LMCT': ['#44aaff', '#66bbff', '#88ccff', '#aaddff', '#cceeFF'],
+    'L3_MLCT': ['#8e6ad8', '#a17ce5', '#b497ec', '#c8b2f2', '#dccdf8'],
+    'L3':      ['#ff8844', '#ffaa66', '#ffcc88', '#ffdd99', '#ffe8bb'],
+    'L3_LMCT': ['#4d8cff', '#6aa1ff', '#88b7ff', '#a8ccff', '#c7e0ff'],
+    'L2_MLCT': ['#7f59c8', '#9571d6', '#ac8ae2', '#c3a4ed', '#dabff6'],
+    'L2':      ['#ee44aa', '#ff66bb', '#ff88cc', '#ffaadd', '#ffccee'],
+    'L2_LMCT': ['#2fa8c8', '#4fb9d6', '#72c9e2', '#99d8eb', '#c2e7f4'],
+    'MLCT':    ['#bb99ff', '#cc88ee', '#ddaaff', '#eeccff', '#f0ddff'],
+    'LMCT':    ['#44aaff', '#66bbff', '#88ccff', '#aaddff', '#cceeFF'],
 }
 
 PEAK_SECTION_BG = {
-    'L3':   '#fff3e0',
-    'L2':   '#fce4ec',
-    'MLCT': '#ede7f6',
-    'LMCT': '#e3f2fd',
+    'L3_MLCT': '#ede7f6',
+    'L3':      '#fff3e0',
+    'L3_LMCT': '#e3f2fd',
+    'L2_MLCT': '#f3ebfb',
+    'L2':      '#fce4ec',
+    'L2_LMCT': '#e0f4f8',
+    'MLCT':    '#ede7f6',
+    'LMCT':    '#e3f2fd',
 }
 
 # Display order matches physical energy ordering low→high:
-# MLCT (pre-L3 or inter-edge) · L3 · LMCT (inter-edge) · L2
-PEAK_KIND_ORDER = ['MLCT', 'L3', 'LMCT', 'L2']
+# L3 MLCT · L3 · L3 LMCT · L2 MLCT · L2 · L2 LMCT
+PEAK_KIND_ORDER = ['L3_MLCT', 'L3', 'L3_LMCT', 'L2_MLCT', 'L2', 'L2_LMCT']
 
 def make_peak(kind, o=854.0, W=1.0, I=0.3, G=0.0, enabled=True):
     """Create a peak parameter dict."""
+    constraints = {}
+    for field in PEAK_FIELDS:
+        lo, hi = PEAK_BOUNDS[kind][field]
+        constraints[field] = {'lock': False, 'lo': float(lo), 'hi': float(hi)}
     return {
         'kind': kind,
         'o':    float(o),
@@ -164,6 +194,7 @@ def make_peak(kind, o=854.0, W=1.0, I=0.3, G=0.0, enabled=True):
         'I':    float(I),
         'G':    float(G),
         'enabled': bool(enabled),
+        'constraints': constraints,
     }
 
 
@@ -213,45 +244,103 @@ class Model:
             new_peaks.append(npk)
         return d, new_peaks
 
-    def bounds(self, peaks, d=None):
-        """
-        Build bounds list matching pack() order.
+    def _calibrated_x(self, x, d):
+        return d.get('Eshift', 0.0) + d.get('Escale', 1.0) * x
 
-        When d is provided, MLCT and LMCT position bounds are constrained
-        relative to E0 and Tk to enforce physical ordering:
-          MLCT  o ∈ [E0 − 15,  Tk − 0.5]  (pre-edge or inter-edge, not into L2)
-          LMCT  o ∈ [E0 + 0.5, Tk − 0.5]  (strictly inter-edge: after L3, before L2)
-          L3    o ∈ [E0 − 5,   Tk − 3   ]  (near L3 region)
-          L2    o ∈ [Tk − 2,   Tk + 15  ]  (near L2 region)
-        """
-        bds = [(p[4], p[5]) for p in PARAMS_STATIC]
-        E0  = d['E0'] if d is not None else None
-        Tk  = self.Tk(E0) if E0 is not None else None
+    def _default_static_constraints(self):
+        return {
+            p[0]: {'lock': bool(p[7]), 'lo': float(p[4]), 'hi': float(p[5])}
+            for p in PARAMS_STATIC
+        }
+
+    def _default_peak_constraints(self, kind):
+        return {
+            field: {'lock': False,
+                    'lo': float(PEAK_BOUNDS[kind][field][0]),
+                    'hi': float(PEAK_BOUNDS[kind][field][1])}
+            for field in PEAK_FIELDS
+        }
+
+    def _merge_static_constraints(self, static_constraints=None):
+        merged = self._default_static_constraints()
+        for key, spec in (static_constraints or {}).items():
+            if key in merged:
+                merged[key].update(spec or {})
+        return merged
+
+    def _peak_constraints(self, pk):
+        merged = self._default_peak_constraints(pk['kind'])
+        for field, spec in (pk.get('constraints') or {}).items():
+            if field in merged:
+                merged[field].update(spec or {})
+        return merged
+
+    def _apply_constraint(self, lo, hi, value, spec):
+        eps = 1e-12
+        lo = float(spec.get('lo', lo))
+        hi = float(spec.get('hi', hi))
+        if spec.get('lock'):
+            center = float(value)
+            return center - eps, center + eps
+        if lo >= hi:
+            center = float(value)
+            lo = min(lo, hi, center) - eps
+            hi = max(lo + eps, hi, center + eps)
+        return lo, hi
+
+    def _dynamic_peak_bounds(self, kind, d):
+        pb = dict(PEAK_BOUNDS[kind])
+        E0 = d['E0'] if d is not None else None
+        if E0 is None:
+            return pb
+        Tk = self.Tk(E0)
+        if kind == 'L3_MLCT':
+            pb['o'] = (E0 - 15.0, E0 + 4.0)
+        elif kind == 'L3':
+            pb['o'] = (E0 - 5.0, Tk - 3.0)
+        elif kind == 'L3_LMCT':
+            pb['o'] = (E0 + 0.2, Tk - 1.5)
+        elif kind == 'L2_MLCT':
+            pb['o'] = (Tk - 6.0, Tk + 2.0)
+        elif kind == 'L2':
+            pb['o'] = (Tk - 2.0, Tk + 15.0)
+        elif kind == 'L2_LMCT':
+            pb['o'] = (Tk + 0.2, Tk + 15.0)
+        elif kind == 'MLCT':
+            pb['o'] = (E0 - 15.0, Tk - 0.5)
+        elif kind == 'LMCT':
+            pb['o'] = (E0 + 0.5, Tk - 0.5)
+        lo, hi = pb['o']
+        if lo >= hi:
+            pb['o'] = (min(lo, hi) - 0.5, max(lo, hi) + 0.5)
+        return pb
+
+    def bounds(self, peaks, d=None, static_constraints=None):
+        """Build bounds list matching pack(), honoring user locks and ranges."""
+        merged_static = self._merge_static_constraints(static_constraints)
+        cur = dict(self.default())
+        if d is not None:
+            cur.update(d)
+        bds = []
+        for key in _KEYS_STATIC:
+            lo, hi = next((p[4], p[5]) for p in PARAMS_STATIC if p[0] == key)
+            bds.append(self._apply_constraint(lo, hi, cur[key], merged_static[key]))
 
         for pk in peaks:
-            if pk['enabled']:
-                kind = pk['kind']
-                pb   = dict(PEAK_BOUNDS[kind])   # copy so we can override 'o'
-                if E0 is not None:
-                    if kind == 'MLCT':
-                        pb['o'] = (E0 - 15.0, Tk - 0.5)
-                    elif kind == 'LMCT':
-                        pb['o'] = (E0 + 0.5,  Tk - 0.5)
-                    elif kind == 'L3':
-                        pb['o'] = (E0 - 5.0,  Tk - 3.0)
-                    elif kind == 'L2':
-                        pb['o'] = (Tk - 2.0,  Tk + 15.0)
-                    # Clamp so lo < hi (in case zeta is small or unusual)
-                    lo, hi = pb['o']
-                    if lo >= hi:
-                        pb['o'] = (min(lo, hi) - 0.5, max(lo, hi) + 0.5)
-                bds += [pb['o'], pb['W'], pb['I'], pb['G']]
+            if not pk['enabled']:
+                continue
+            pb = self._dynamic_peak_bounds(pk['kind'], cur)
+            cons = self._peak_constraints(pk)
+            for field in PEAK_FIELDS:
+                lo, hi = pb[field]
+                bds.append(self._apply_constraint(lo, hi, pk[field], cons[field]))
         return bds
 
     # ── Spectral components ────────────────────────────────────────────────
 
     def get_bg(self, x, d):
-        return bg4(x, d['Ek'], d['E0'], self.Tk(d['E0']), d['Et'],
+        x_eval = self._calibrated_x(x, d)
+        return bg4(x_eval, d['Ek'], d['E0'], self.Tk(d['E0']), d['Et'],
                    d['C'], d['m1'], d['m2'], d['a_log'], d['c_log'],
                    d['b'], d['m4'])
 
@@ -259,38 +348,34 @@ class Model:
 
     def _l2_scale(self, peaks, br):
         """
-        Return the scaling factor to apply to all enabled L2 peak intensities
-        so that  sum(I_L2_effective) = br * sum(I_L3_effective).
-
-        When br is None the constraint is off and the scale is 1.0.
-
-        The L2 peak 'I' values stored in the panel represent relative multiplet
-        weights between L2 peaks; their *absolute* scale is set by this factor.
-        This prevents the optimizer from making L2 intensities independently
-        large and keeps the fit physically sensible.
+        The branch ratio is now treated as a soft target in the fitter rather
+        than an exact rescaling rule. Model evaluation therefore leaves the
+        entered L2 intensities untouched.
         """
-        if br is None:
-            return 1.0
-        IL3 = sum(pk['I'] for pk in peaks if pk['enabled'] and pk['kind'] == 'L3')
-        IL2 = sum(pk['I'] for pk in peaks if pk['enabled'] and pk['kind'] == 'L2')
-        return (float(br) * IL3 / IL2) if IL2 > 1e-12 else 1.0
+        return 1.0
+
+    def branch_ratio(self, peaks):
+        il3 = sum(pk['I'] for pk in peaks if pk['enabled'] and _is_l3_kind(pk['kind']))
+        il2 = sum(pk['I'] for pk in peaks if pk['enabled'] and _is_l2_kind(pk['kind']))
+        return il2 / il3 if il3 > 1e-12 else np.nan
 
     # ── Spectral components ────────────────────────────────────────────────
 
     def get_full(self, x, d, peaks, br=None):
         """Full model: B(x) + edge steps + all enabled peaks."""
+        x_eval = self._calibrated_x(x, d)
         Tk     = self.Tk(d['E0'])
-        bgv    = bg4(x, d['Ek'], d['E0'], Tk, d['Et'],
+        bgv    = bg4(x_eval, d['Ek'], d['E0'], Tk, d['Et'],
                      d['C'], d['m1'], d['m2'], d['a_log'], d['c_log'],
                      d['b'], d['m4'])
-        eL3    = cpv(x, d['E0'], d['WL3_Edge'], d['IL3_Edge'],       d['GL3_Edge'])
-        eL2    = cpv(x, Tk,      d['WL2_Edge'], d['IL3_Edge'] / 2.0, d['GL2_Edge'])
+        eL3    = cpv(x_eval, d['E0'], d['WL3_Edge'], d['IL3_Edge'],       d['GL3_Edge'])
+        eL2    = cpv(x_eval, Tk,      d['WL2_Edge'], d['IL3_Edge'] / 2.0, d['GL2_Edge'])
         tot    = bgv + eL3 + eL2
         l2_sc  = self._l2_scale(peaks, br)
         for pk in peaks:
             if pk['enabled']:
-                eff_I = pk['I'] * l2_sc if pk['kind'] == 'L2' else pk['I']
-                tot  += pv(x, pk['o'], pk['W'], eff_I, pk['G'])
+                eff_I = pk['I'] * l2_sc if _is_l2_kind(pk['kind']) else pk['I']
+                tot  += pv(x_eval, pk['o'], pk['W'], eff_I, pk['G'])
         return tot
 
     def get_norm(self, x, y, d):
@@ -301,43 +386,45 @@ class Model:
 
     def get_norm_components(self, x, d, peaks, br=None):
         """Normalized spectral components for decomposition plot."""
+        x_eval = self._calibrated_x(x, d)
         Tk    = self.Tk(d['E0'])
         f     = max(1.5 * d['IL3_Edge'], 1e-12)
         l2_sc = self._l2_scale(peaks, br)
         c = {
-            'eL3': cpv(x, d['E0'], d['WL3_Edge'], d['IL3_Edge'],       d['GL3_Edge']) / f,
-            'eL2': cpv(x, Tk,      d['WL2_Edge'], d['IL3_Edge'] / 2.0, d['GL2_Edge']) / f,
+            'eL3': cpv(x_eval, d['E0'], d['WL3_Edge'], d['IL3_Edge'],       d['GL3_Edge']) / f,
+            'eL2': cpv(x_eval, Tk,      d['WL2_Edge'], d['IL3_Edge'] / 2.0, d['GL2_Edge']) / f,
         }
         kind_count = {}
         for pk in peaks:
             if pk['enabled']:
                 kind  = pk['kind']
                 n     = kind_count.get(kind, 0)
-                eff_I = pk['I'] * l2_sc if kind == 'L2' else pk['I']
-                c[f'p{kind}_{n}'] = pv(x, pk['o'], pk['W'], eff_I, pk['G']) / f
+                eff_I = pk['I'] * l2_sc if _is_l2_kind(kind) else pk['I']
+                c[f'p{kind}_{n}'] = pv(x_eval, pk['o'], pk['W'], eff_I, pk['G']) / f
                 kind_count[kind]  = n + 1
         return c
 
     def get_norm_full_model(self, x, d, peaks, br=None):
         """Normalized total model (no background)."""
+        x_eval = self._calibrated_x(x, d)
         Tk    = self.Tk(d['E0'])
         f     = max(1.5 * d['IL3_Edge'], 1e-12)
         l2_sc = self._l2_scale(peaks, br)
-        eL3   = cpv(x, d['E0'], d['WL3_Edge'], d['IL3_Edge'],       d['GL3_Edge'])
-        eL2   = cpv(x, Tk,      d['WL2_Edge'], d['IL3_Edge'] / 2.0, d['GL2_Edge'])
+        eL3   = cpv(x_eval, d['E0'], d['WL3_Edge'], d['IL3_Edge'],       d['GL3_Edge'])
+        eL2   = cpv(x_eval, Tk,      d['WL2_Edge'], d['IL3_Edge'] / 2.0, d['GL2_Edge'])
         tot   = eL3 + eL2
         for pk in peaks:
             if pk['enabled']:
-                eff_I = pk['I'] * l2_sc if pk['kind'] == 'L2' else pk['I']
-                tot  += pv(x, pk['o'], pk['W'], eff_I, pk['G'])
+                eff_I = pk['I'] * l2_sc if _is_l2_kind(pk['kind']) else pk['I']
+                tot  += pv(x_eval, pk['o'], pk['W'], eff_I, pk['G'])
         return tot / f
 
     def il3_plus_2il2_norm(self, d, peaks, br=None):
-        """Normalized peak intensity IL3_total + 2*IL2_total."""
+        """Normalized manifold intensity IL3_total + 2*IL2_total."""
         f     = max(1.5 * d['IL3_Edge'], 1e-12)
         l2_sc = self._l2_scale(peaks, br)
-        IL3   = sum(pk['I']          for pk in peaks if pk['enabled'] and pk['kind'] == 'L3')
-        IL2   = sum(pk['I'] * l2_sc  for pk in peaks if pk['enabled'] and pk['kind'] == 'L2')
+        IL3   = sum(pk['I']         for pk in peaks if pk['enabled'] and _is_l3_kind(pk['kind']))
+        IL2   = sum(pk['I'] * l2_sc for pk in peaks if pk['enabled'] and _is_l2_kind(pk['kind']))
         return (IL3 + 2.0 * IL2) / f
 
     # ── Goodness of fit ────────────────────────────────────────────────────
@@ -354,21 +441,182 @@ class Model:
 
     # ── Fitting ────────────────────────────────────────────────────────────
 
-    def fit_once(self, x, y, d0, peaks, fixed=('Ek',), br=None):
-        """Single L-BFGS-B nonlinear least-squares fit."""
-        v0  = self.pack(d0, peaks)
-        bds = list(self.bounds(peaks, d=d0))
-        for i, k in enumerate(_KEYS_STATIC):
-            if k in fixed:
-                bds[i] = (v0[i] - 1e-12, v0[i] + 1e-12)
-        result = minimize(self.chi2_vec, v0, args=(x, y, peaks, br),
-                          method='L-BFGS-B', bounds=bds,
-                          options={'maxiter': 8000, 'ftol': 1e-14, 'gtol': 1e-9})
-        return self.unpack(result.x, peaks)   # returns (d, peaks)
+    def _stage_peaks(self, peaks, stage):
+        out = [dict(pk) for pk in peaks]
+        if stage == 'background':
+            for pk in out:
+                pk['enabled'] = False
+        elif stage == 'manifold':
+            for pk in out:
+                pk['enabled'] = pk['enabled'] and pk['kind'] in ('L3', 'L2')
+        return out
+
+    def _weight_vector(self, x_eval, d, stage):
+        E0 = d['E0']
+        Tk = self.Tk(E0)
+        Et = d['Et']
+        w = np.ones_like(x_eval, dtype=float)
+
+        pre = x_eval <= E0 - 3.0
+        l3_peak = (x_eval >= E0 - 1.0) & (x_eval <= E0 + 3.5)
+        inter = (x_eval >= E0 + 4.0) & (x_eval <= Tk - 2.0)
+        l2_peak = (x_eval >= Tk - 1.0) & (x_eval <= Tk + 3.5)
+        post = x_eval >= max(Tk + 6.0, Et)
+
+        w[pre] = 2.8
+        w[inter] = 1.8
+        w[post] = 2.2
+        w[l3_peak] = 0.9
+        w[l2_peak] = 1.0
+
+        if stage == 'background':
+            w[l3_peak] *= 0.20
+            w[l2_peak] *= 0.25
+            w[inter] *= 0.70
+        elif stage == 'manifold':
+            w[l3_peak] *= 1.15
+            w[l2_peak] *= 1.15
+        elif stage == 'full':
+            w[inter] *= 1.25
+
+        mean_w = np.mean(w) if np.mean(w) > 1e-12 else 1.0
+        return w / mean_w
+
+    def _penalty_residuals(self, x, y, d, peaks, br_target=None, stage='full'):
+        x_eval = self._calibrated_x(x, d)
+        bg = self.get_bg(x, d)
+        dx = max(float(np.mean(np.diff(x))), 1e-6)
+        signal_scale = max(float(np.ptp(y)), 1e-6)
+        slope_scale = max(signal_scale / max(float(x[-1] - x[0]), 1e-6), 1e-6)
+
+        bg_grad = np.gradient(bg, dx)
+        bg_curv = np.gradient(bg_grad, dx)
+        penalties = []
+
+        if br_target is not None:
+            actual_br = self.branch_ratio(peaks)
+            if np.isfinite(actual_br):
+                penalties.append(4.0 * (actual_br - float(br_target)))
+
+        pre_mask = x_eval <= d['E0'] - 4.0
+        post_mask = x_eval >= max(self.Tk(d['E0']) + 6.0, d['Et'])
+        for mask in (pre_mask, post_mask):
+            if np.any(mask):
+                slope = float(np.mean(bg_grad[mask]))
+                tol = 0.35 * slope_scale
+                over = max(0.0, abs(slope) - tol)
+                penalties.append(2.0 * over / max(tol, 1e-9))
+
+        smooth_mask = pre_mask | post_mask
+        if np.any(smooth_mask):
+            curv_rms = float(np.sqrt(np.mean(bg_curv[smooth_mask]**2)))
+            tol = 0.50 * slope_scale / max(float(x[-1] - x[0]), 1e-6)
+            over = max(0.0, curv_rms - tol)
+            penalties.append(1.5 * over / max(tol, 1e-9))
+
+        if stage == 'background':
+            escale_dev = abs(d.get('Escale', 1.0) - 1.0)
+            penalties.append(2.0 * escale_dev / 0.01)
+
+        return np.asarray(penalties, dtype=float)
+
+    def residual_vector(self, v, x, y, peaks, stage='full',
+                        static_constraints=None, fixed=(), br_target=None):
+        d, pks = self.unpack(v, peaks)
+        x_eval = self._calibrated_x(x, d)
+        y_model = self.get_full(x, d, pks, br=None)
+
+        weights = self._weight_vector(x_eval, d, stage)
+        signal_scale = max(float(np.ptp(y)), 1e-6)
+        resid = weights * (y - y_model) / signal_scale
+
+        deriv_weight = 0.00 if stage == 'background' else (0.10 if stage == 'manifold' else 0.18)
+        if deriv_weight > 0:
+            dx = max(float(np.mean(np.diff(x))), 1e-6)
+            dy = np.gradient(y, dx)
+            dm = np.gradient(y_model, dx)
+            grad_scale = max(float(np.ptp(dy)), signal_scale / max(float(x[-1] - x[0]), 1e-6), 1e-6)
+            resid_deriv = np.sqrt(weights) * deriv_weight * (dy - dm) / grad_scale
+        else:
+            resid_deriv = np.array([], dtype=float)
+
+        penalties = self._penalty_residuals(x, y, d, pks, br_target=br_target, stage=stage)
+        return np.concatenate([resid, resid_deriv, penalties])
+
+    def _scalar_cost(self, v, x, y, peaks, stage, static_constraints, fixed, br_target):
+        r = self.residual_vector(v, x, y, peaks, stage=stage,
+                                 static_constraints=static_constraints,
+                                 fixed=fixed, br_target=br_target)
+        return float(np.dot(r, r))
+
+    def _fit_stage(self, x, y, d0, peaks, fixed=(), br_target=None,
+                   static_constraints=None, stage='full', global_init=False):
+        v0 = self.pack(d0, peaks)
+        bds = list(self.bounds(peaks, d=d0, static_constraints=static_constraints))
+        for i, key in enumerate(_KEYS_STATIC):
+            if key in fixed:
+                center = v0[i]
+                bds[i] = (center - 1e-12, center + 1e-12)
+        lb = np.array([b[0] for b in bds], dtype=float)
+        ub = np.array([b[1] for b in bds], dtype=float)
+
+        if global_init and len(v0) <= 24:
+            try:
+                de = differential_evolution(
+                    lambda vec: self._scalar_cost(vec, x, y, peaks, stage,
+                                                  static_constraints, fixed, br_target),
+                    bounds=bds, maxiter=18, popsize=8, polish=False,
+                    updating='deferred', workers=1)
+                v0 = np.clip(de.x, lb, ub)
+            except Exception:
+                pass
+
+        result = least_squares(
+            self.residual_vector, v0,
+            args=(x, y, peaks, stage, static_constraints, fixed, br_target),
+            bounds=(lb, ub),
+            method='trf',
+            loss='soft_l1',
+            f_scale=0.25,
+            x_scale='jac',
+            max_nfev=6000)
+        return self.unpack(result.x, peaks)
+
+    def fit_once(self, x, y, d0, peaks, fixed=('Ek',), br=None,
+                 static_constraints=None, global_init=False):
+        """Staged weighted robust least-squares fit with optional global init."""
+        d_cur = dict(d0)
+        peaks_cur = [dict(pk) for pk in peaks]
+
+        stage_specs = [
+            ('background', False),
+            ('manifold', False),
+            ('full', bool(global_init)),
+        ]
+        for stage, use_global in stage_specs:
+            stage_peaks = self._stage_peaks(peaks_cur, stage)
+            d_next, fitted_stage_peaks = self._fit_stage(
+                x, y, d_cur, stage_peaks,
+                fixed=fixed,
+                br_target=br,
+                static_constraints=static_constraints,
+                stage=stage,
+                global_init=use_global)
+            merged_peaks = []
+            for base_pk, stage_pk in zip(peaks_cur, fitted_stage_peaks):
+                merged = dict(base_pk)
+                if stage_pk.get('enabled', False):
+                    for field in PEAK_FIELDS:
+                        merged[field] = stage_pk[field]
+                merged_peaks.append(merged)
+            d_cur = d_next
+            peaks_cur = merged_peaks
+        return d_cur, peaks_cur
 
     def mc_fit(self, x, y, d0, peaks, n=200, spread=0.10,
                fixed=('Ek',), br=None, cb=None, stop_event=None,
-               live_cb=None, live_every=10):
+               live_cb=None, live_every=10, static_constraints=None,
+               global_init=False):
         """
         Monte Carlo fitting: n fits from randomly perturbed starting points.
         Returns list of (d, peaks) tuples for the surviving fits.
@@ -376,10 +624,10 @@ class Model:
         live_cb(d, peaks) is called with the current best fit every
         live_every iterations so the GUI can show intermediate progress.
         """
-        bnd_static = {p[0]: (p[4], p[5]) for p in PARAMS_STATIC}
         v0       = self.pack(d0, peaks)
         n_static = len(_KEYS_STATIC)
         out      = []
+        base_bounds = self.bounds(peaks, d=d0, static_constraints=static_constraints)
 
         for i in range(n):
             if stop_event and stop_event.is_set():
@@ -389,13 +637,13 @@ class Model:
             for j, k in enumerate(_KEYS_STATIC):
                 if k in fixed:
                     continue
-                lo, hi = bnd_static[k]
+                lo, hi = base_bounds[j]
                 v[j] = np.clip(
                     v[j] + np.random.uniform(-(hi - lo) * spread,
                                               (hi - lo) * spread), lo, hi)
             # Perturb peak params (use dynamic bounds relative to current d)
             d_tmp, _ = self.unpack(v, peaks)
-            dyn_bds  = self.bounds(peaks, d=d_tmp)
+            dyn_bds  = self.bounds(peaks, d=d_tmp, static_constraints=static_constraints)
             idx      = n_static
             pk_bnd_idx = n_static  # parallel index into dyn_bds
             for pk in peaks:
@@ -409,7 +657,12 @@ class Model:
                     pk_bnd_idx += 4
             try:
                 d_try, pks_try = self.unpack(v, peaks)
-                d_f, pks_f     = self.fit_once(x, y, d_try, pks_try, fixed=fixed, br=br)
+                d_f, pks_f = self.fit_once(
+                    x, y, d_try, pks_try,
+                    fixed=fixed,
+                    br=br,
+                    static_constraints=static_constraints,
+                    global_init=global_init and i == 0)
                 c2 = self.chi2_vec(self.pack(d_f, pks_f), x, y, pks_f, br=br)
                 out.append((c2, d_f, pks_f))
             except Exception:
@@ -572,6 +825,10 @@ class ParamPanel(tk.Frame):
         self._on_change = on_change
         self._vars      = {}
         self._entries   = {}
+        self._constraints = {
+            p[0]: {'lock': bool(p[7]), 'lo': float(p[4]), 'hi': float(p[5])}
+            for p in PARAMS_STATIC
+        }
 
         canvas = tk.Canvas(self, bd=0, highlightthickness=0)
         vsb    = ttk.Scrollbar(self, orient='vertical', command=canvas.yview)
@@ -665,6 +922,14 @@ class ParamPanel(tk.Frame):
             if key in d:
                 self._vars[key].set(f'{d[key]:.6g}')
 
+    def get_constraints(self):
+        return {k: dict(v) for k, v in self._constraints.items()}
+
+    def set_constraints(self, constraints):
+        for key, spec in (constraints or {}).items():
+            if key in self._constraints:
+                self._constraints[key].update(spec or {})
+
     def set_entry_bg(self, key, color):
         if key in self._entries:
             self._entries[key].config(bg=color)
@@ -689,6 +954,7 @@ class _PeakRow(tk.Frame):
         self._on_change = on_change
         self._on_remove = on_remove
         self._vars      = {}
+        self._constraints = {}
 
         # ── Row 1: header (enable checkbox, label, remove button) ──────────
         hdr = tk.Frame(self, bg=self['bg'])
@@ -710,6 +976,13 @@ class _PeakRow(tk.Frame):
 
         for col, field in enumerate(PEAK_FIELDS):
             lo, hi = PEAK_BOUNDS[kind][field]
+            spec = ((peak_dict.get('constraints') or {}).get(field) or
+                    {'lock': False, 'lo': lo, 'hi': hi})
+            self._constraints[field] = {
+                'lock': bool(spec.get('lock', False)),
+                'lo': float(spec.get('lo', lo)),
+                'hi': float(spec.get('hi', hi)),
+            }
             var = tk.StringVar(value=f'{peak_dict.get(field, 0.0):.5g}')
             self._vars[field] = var
 
@@ -763,6 +1036,7 @@ class _PeakRow(tk.Frame):
                 d[field] = float(self._vars[field].get())
             except ValueError:
                 d[field] = (lo + hi) / 2.0
+        d['constraints'] = {k: dict(v) for k, v in self._constraints.items()}
         return d
 
     def set_peak(self, peak_dict):
@@ -770,12 +1044,19 @@ class _PeakRow(tk.Frame):
         for field in PEAK_FIELDS:
             if field in peak_dict:
                 self._vars[field].set(f'{peak_dict[field]:.5g}')
+            lo, hi = PEAK_BOUNDS[self._kind][field]
+            spec = ((peak_dict.get('constraints') or {}).get(field) or {})
+            self._constraints[field] = {
+                'lock': bool(spec.get('lock', False)),
+                'lo': float(spec.get('lo', lo)),
+                'hi': float(spec.get('hi', hi)),
+            }
 
 
 class DynamicPeakPanel(tk.Frame):
     """
-    Scrollable panel with dynamically add-able / removable peaks.
-    Peaks are grouped by kind: L3, L2, MLCT, LMCT.
+        Scrollable panel with dynamically add-able / removable peaks.
+        Peaks are grouped into edge-resolved white-line / CT sections.
     """
 
     def __init__(self, master, on_change=None, **kw):
@@ -830,13 +1111,15 @@ class DynamicPeakPanel(tk.Frame):
 
     def _add_peak_default(self, kind):
         # Default positions reflect physical energy ordering for Ni L-edge:
-        #   MLCT (pre-edge ~851)  →  L3 white line (~854)
-        #   →  LMCT (inter-edge ~857)  →  L2 white line (~871)
+        #   L3 MLCT (~851) → L3 white line (~854) → L3 LMCT (~857)
+        #   → L2 MLCT (~868) → L2 white line (~871) → L2 LMCT (~874)
         defaults = {
-            'MLCT': make_peak('MLCT', o=851.0, W=1.5, I=0.05, G=0.0),
-            'L3':   make_peak('L3',   o=854.0, W=1.0, I=0.30, G=0.0),
-            'LMCT': make_peak('LMCT', o=857.0, W=2.0, I=0.05, G=0.0),
-            'L2':   make_peak('L2',   o=871.0, W=2.0, I=0.15, G=0.0),
+            'L3_MLCT': make_peak('L3_MLCT', o=851.0, W=1.5, I=0.05, G=0.0),
+            'L3':      make_peak('L3',      o=854.0, W=1.0, I=0.30, G=0.0),
+            'L3_LMCT': make_peak('L3_LMCT', o=857.0, W=1.6, I=0.06, G=0.0),
+            'L2_MLCT': make_peak('L2_MLCT', o=868.0, W=1.6, I=0.04, G=0.0),
+            'L2':      make_peak('L2',      o=871.0, W=2.0, I=0.15, G=0.0),
+            'L2_LMCT': make_peak('L2_LMCT', o=874.0, W=1.8, I=0.05, G=0.0),
         }
         self.add_peak(kind, defaults[kind])
 
@@ -914,6 +1197,161 @@ class DynamicPeakPanel(tk.Frame):
         self._rows.clear()
 
 
+class ConstraintDialog(tk.Toplevel):
+    """Scrollable dialog for editing locks and numeric bounds."""
+
+    def __init__(self, master, params, param_constraints, peaks):
+        super().__init__(master)
+        self.title('Fit Constraints')
+        self.geometry('860x720')
+        self.minsize(760, 520)
+        self.transient(master)
+        self.grab_set()
+
+        self._result = None
+        self._param_vars = {}
+        self._peak_vars = []
+
+        nb = ttk.Notebook(self)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        params_tab = self._make_scrollable_tab(nb)
+        peaks_tab = self._make_scrollable_tab(nb)
+        nb.add(params_tab['outer'], text='Static Parameters')
+        nb.add(peaks_tab['outer'], text='Peak Parameters')
+
+        self._build_param_rows(params_tab['inner'], params, param_constraints)
+        self._build_peak_rows(peaks_tab['inner'], peaks)
+
+        btns = tk.Frame(self)
+        btns.pack(fill=tk.X, padx=8, pady=(0, 8))
+        tk.Button(btns, text='Cancel', command=self._cancel).pack(side=tk.RIGHT, padx=4)
+        tk.Button(btns, text='Apply', command=self._apply, bg='#dff0d8').pack(side=tk.RIGHT, padx=4)
+
+        self.bind('<Escape>', lambda e: self._cancel())
+
+    def _make_scrollable_tab(self, notebook):
+        outer = tk.Frame(notebook)
+        canvas = tk.Canvas(outer, bd=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        inner = tk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>', lambda e: canvas.itemconfig(win_id, width=e.width))
+        return {'outer': outer, 'inner': inner}
+
+    def _add_headers(self, parent):
+        headers = [('Parameter', 0), ('Value', 1), ('Lock', 2), ('Min', 3), ('Max', 4)]
+        for text, col in headers:
+            tk.Label(parent, text=text, font=('TkDefaultFont', 8, 'bold')).grid(
+                row=0, column=col, sticky='w', padx=4, pady=(4, 2))
+
+    def _build_param_rows(self, parent, params, constraints):
+        self._add_headers(parent)
+        row = 1
+        current_section = None
+        for key, section, label, default, lo, hi, step, fixed in PARAMS_STATIC:
+            if section != current_section:
+                current_section = section
+                tk.Label(parent, text=section, font=('TkDefaultFont', 8, 'bold'),
+                         fg='#335').grid(row=row, column=0, columnspan=5, sticky='w',
+                                         padx=4, pady=(8, 2))
+                row += 1
+            spec = dict(constraints.get(key, {'lock': fixed, 'lo': lo, 'hi': hi}))
+            lock_var = tk.BooleanVar(value=bool(spec.get('lock', fixed)))
+            lo_var = tk.StringVar(value=f"{float(spec.get('lo', lo)):.6g}")
+            hi_var = tk.StringVar(value=f"{float(spec.get('hi', hi)):.6g}")
+            self._param_vars[key] = {'lock': lock_var, 'lo': lo_var, 'hi': hi_var}
+            tk.Label(parent, text=label, anchor='w').grid(row=row, column=0, sticky='w', padx=4, pady=1)
+            tk.Label(parent, text=f"{params.get(key, default):.6g}",
+                     font=('TkFixedFont', 8), fg='#555').grid(row=row, column=1, sticky='w', padx=4, pady=1)
+            tk.Checkbutton(parent, variable=lock_var).grid(row=row, column=2, sticky='w', padx=4, pady=1)
+            tk.Entry(parent, textvariable=lo_var, width=10, font=('TkFixedFont', 8)).grid(
+                row=row, column=3, sticky='we', padx=4, pady=1)
+            tk.Entry(parent, textvariable=hi_var, width=10, font=('TkFixedFont', 8)).grid(
+                row=row, column=4, sticky='we', padx=4, pady=1)
+            row += 1
+        parent.columnconfigure(0, weight=1)
+
+    def _build_peak_rows(self, parent, peaks):
+        self._add_headers(parent)
+        row = 1
+        for pi, pk in enumerate(peaks):
+            kind = pk['kind']
+            title = f'{kind} #{pi + 1}'
+            tk.Label(parent, text=title, font=('TkDefaultFont', 8, 'bold'),
+                     fg='#335').grid(row=row, column=0, columnspan=5, sticky='w',
+                                     padx=4, pady=(8, 2))
+            row += 1
+            peak_spec = {}
+            for field in PEAK_FIELDS:
+                default_lo, default_hi = PEAK_BOUNDS[kind][field]
+                spec = ((pk.get('constraints') or {}).get(field) or
+                        {'lock': False, 'lo': default_lo, 'hi': default_hi})
+                lock_var = tk.BooleanVar(value=bool(spec.get('lock', False)))
+                lo_var = tk.StringVar(value=f"{float(spec.get('lo', default_lo)):.6g}")
+                hi_var = tk.StringVar(value=f"{float(spec.get('hi', default_hi)):.6g}")
+                peak_spec[field] = {'lock': lock_var, 'lo': lo_var, 'hi': hi_var}
+                tk.Label(parent, text=field, anchor='w').grid(row=row, column=0, sticky='w', padx=18, pady=1)
+                tk.Label(parent, text=f"{pk.get(field, 0.0):.6g}",
+                         font=('TkFixedFont', 8), fg='#555').grid(row=row, column=1, sticky='w', padx=4, pady=1)
+                tk.Checkbutton(parent, variable=lock_var).grid(row=row, column=2, sticky='w', padx=4, pady=1)
+                tk.Entry(parent, textvariable=lo_var, width=10, font=('TkFixedFont', 8)).grid(
+                    row=row, column=3, sticky='we', padx=4, pady=1)
+                tk.Entry(parent, textvariable=hi_var, width=10, font=('TkFixedFont', 8)).grid(
+                    row=row, column=4, sticky='we', padx=4, pady=1)
+                row += 1
+            self._peak_vars.append(peak_spec)
+        parent.columnconfigure(0, weight=1)
+
+    def _collect_result(self):
+        param_constraints = {}
+        for key, spec in self._param_vars.items():
+            try:
+                lo = float(spec['lo'].get())
+                hi = float(spec['hi'].get())
+            except ValueError:
+                raise ValueError(f'Invalid range for {key}.')
+            if lo >= hi and not spec['lock'].get():
+                raise ValueError(f'Lower bound must be smaller than upper bound for {key}.')
+            param_constraints[key] = {'lock': bool(spec['lock'].get()), 'lo': lo, 'hi': hi}
+
+        peak_constraints = []
+        for pi, peak_spec in enumerate(self._peak_vars):
+            cons = {}
+            for field, spec in peak_spec.items():
+                try:
+                    lo = float(spec['lo'].get())
+                    hi = float(spec['hi'].get())
+                except ValueError:
+                    raise ValueError(f'Invalid peak range for peak #{pi + 1} field {field}.')
+                if lo >= hi and not spec['lock'].get():
+                    raise ValueError(f'Lower bound must be smaller than upper bound for peak #{pi + 1} field {field}.')
+                cons[field] = {'lock': bool(spec['lock'].get()), 'lo': lo, 'hi': hi}
+            peak_constraints.append(cons)
+        return param_constraints, peak_constraints
+
+    def _apply(self):
+        try:
+            self._result = self._collect_result()
+        except Exception as e:
+            messagebox.showerror('Constraint error', str(e), parent=self)
+            return
+        self.destroy()
+
+    def _cancel(self):
+        self._result = None
+        self.destroy()
+
+    @property
+    def result(self):
+        return self._result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Main application
 # ══════════════════════════════════════════════════════════════════════════════
@@ -941,11 +1379,13 @@ class LEdgeNormApp(tk.Tk):
 
         # ── Model ──────────────────────────────────────────────────────────
         self._element_var  = tk.StringVar(value='Ni')
+        self._symmetry_var = tk.StringVar(value='Oh')
         self._lock_e0_var  = tk.BooleanVar(value=True)
         self._lock_br_var  = tk.BooleanVar(value=True)   # L2/L3 peak ratio locked by default
-        self._br_var       = tk.StringVar(value='0.5')   # statistical 2:1 branching ratio
+        self._br_var       = tk.StringVar(value='0.5')   # statistical 2:1 manifold branching ratio
         self._mc_n_var     = tk.StringVar(value='200')
         self._spread_var   = tk.StringVar(value='0.10')
+        self._global_init_var = tk.BooleanVar(value=True)
         self._model        = Model(zeta=SOC['Ni'])
 
         self._build_menu()
@@ -967,6 +1407,8 @@ class LEdgeNormApp(tk.Tk):
                        command=self._save_normalized)
         fm.add_command(label='Save Fit Parameters…',
                        command=self._save_params)
+        fm.add_command(label='Save Quanty Seed Bundle…',
+                       command=self._save_quanty_bundle)
         fm.add_separator()
         fm.add_command(label='Exit', command=self.destroy)
         mb.add_cascade(label='File', menu=fm)
@@ -998,6 +1440,14 @@ class LEdgeNormApp(tk.Tk):
 
         ttk.Separator(bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
+        tk.Label(bar, text='Symmetry:').pack(side=tk.LEFT, padx=(0, 2))
+        ttk.Combobox(bar, textvariable=self._symmetry_var,
+                     values=SUPPORTED_SITE_SYMMETRIES,
+                     state='readonly', width=6
+                     ).pack(side=tk.LEFT, padx=(0, 4))
+
+        ttk.Separator(bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=6)
+
         tk.Checkbutton(bar, text='Lock E0', variable=self._lock_e0_var
                        ).pack(side=tk.LEFT, padx=(4, 2))
 
@@ -1018,6 +1468,8 @@ class LEdgeNormApp(tk.Tk):
         tk.Label(bar, text='Spread:').pack(side=tk.LEFT)
         tk.Entry(bar, textvariable=self._spread_var, width=5,
                  font=('TkFixedFont', 9)).pack(side=tk.LEFT, padx=(2, 8))
+        tk.Checkbutton(bar, text='Global init', variable=self._global_init_var
+                       ).pack(side=tk.LEFT, padx=(2, 2))
 
         ttk.Separator(bar, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=6)
 
@@ -1032,6 +1484,8 @@ class LEdgeNormApp(tk.Tk):
 
         tk.Button(bar, text='Auto-Estimate', command=self._auto_estimate,
                   bg='#fff3b0').pack(side=tk.LEFT, padx=3)
+        tk.Button(bar, text='Constraints…',  command=self._edit_constraints,
+                  bg='#f0e0ff').pack(side=tk.LEFT, padx=3)
         tk.Button(bar, text='Fit Once',      command=self._fit_once,
                   bg='#ffddb0').pack(side=tk.LEFT, padx=3)
         tk.Button(bar, text='Monte Carlo',   command=self._run_mc,
@@ -1043,6 +1497,8 @@ class LEdgeNormApp(tk.Tk):
 
         tk.Button(bar, text='Export Norm.', command=self._save_normalized,
                   bg='#e8d0ff').pack(side=tk.LEFT, padx=3)
+        tk.Button(bar, text='Export Quanty', command=self._save_quanty_bundle,
+                  bg='#d8d8ff').pack(side=tk.LEFT, padx=3)
 
     def _build_body(self):
         pw = tk.PanedWindow(self, orient=tk.HORIZONTAL, sashrelief='raised', sashwidth=5)
@@ -1118,7 +1574,7 @@ class LEdgeNormApp(tk.Tk):
         ttk.Separator(right, orient='horizontal').pack(fill=tk.X, pady=4)
 
         # Peaks (bottom ~60%)
-        tk.Label(right, text='Peaks  (MLCT → L3 → LMCT → L2)',
+        tk.Label(right, text='Peaks  (L3 MLCT → L3 → L3 LMCT → L2 MLCT → L2 → L2 LMCT)',
                  font=('TkDefaultFont', 9, 'bold')).pack(anchor='w', padx=4, pady=(0, 2))
         self._peak_panel = DynamicPeakPanel(right, on_change=self._on_param_change)
         self._peak_panel.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
@@ -1178,10 +1634,14 @@ class LEdgeNormApp(tk.Tk):
             fixed.append('E0')
         return tuple(fixed)
 
+    def _get_static_constraints(self):
+        return self._param_panel.get_constraints()
+
     def _get_br(self):
         """
-        Return the L2/L3 branching ratio if locked, else None.
-        When None the constraint is off and L2 peak intensities are free.
+        Return the target L2/L3 manifold branching ratio if constrained, else None.
+        The fitter treats this as a soft physical target rather than an exact
+        algebraic rescaling.
         Statistical value for L-edges: 0.5  (2:1 branching ratio L3:L2).
         """
         if not self._lock_br_var.get():
@@ -1191,6 +1651,22 @@ class LEdgeNormApp(tk.Tk):
             return max(0.01, min(2.0, val))   # sensible guard rails
         except ValueError:
             return 0.5
+
+    def _edit_constraints(self):
+        params = self._param_panel.get_params()
+        peaks = self._peak_panel.get_peaks()
+        dlg = ConstraintDialog(self, params, self._param_panel.get_constraints(), peaks)
+        self.wait_window(dlg)
+        if not dlg.result:
+            return
+        param_constraints, peak_constraints = dlg.result
+        self._param_panel.set_constraints(param_constraints)
+        updated_peaks = self._peak_panel.get_peaks()
+        for pk, cons in zip(updated_peaks, peak_constraints):
+            pk['constraints'] = cons
+        self._peak_panel.set_peaks(updated_peaks)
+        self._set_status('Updated fit locks and numeric ranges.')
+        self._update_plot()
 
     # ══════════════════════════════════════════════════════════════════════
     #  Scan management
@@ -1506,7 +1982,11 @@ class LEdgeNormApp(tk.Tk):
         try:
             br = self._get_br()
             d_fit, pks_fit = self._model.fit_once(
-                self._x_sum, self._y_sum, d0, peaks, fixed=self._get_fixed(), br=br)
+                self._x_sum, self._y_sum, d0, peaks,
+                fixed=self._get_fixed(),
+                br=br,
+                static_constraints=self._get_static_constraints(),
+                global_init=self._global_init_var.get())
             self._best_d     = d_fit
             self._best_peaks = pks_fit
             self._param_panel.set_params(d_fit)
@@ -1515,8 +1995,13 @@ class LEdgeNormApp(tk.Tk):
             c2  = self._model.chi2_vec(
                 self._model.pack(d_fit, pks_fit), self._x_sum, self._y_sum, pks_fit, br=br)
             val = self._model.il3_plus_2il2_norm(d_fit, pks_fit, br=br)
+            br_txt = ''
+            if br is not None:
+                br_now = self._model.branch_ratio(pks_fit)
+                if np.isfinite(br_now):
+                    br_txt = f'  BR={br_now:.4f} (target {br:.4f})'
             self._set_status(f'Fit done.  chi2={c2:.5g}  r²={r2:.6f}  '
-                             f'IL3+2IL2(norm)={val:.4f}')
+                             f'IL3+2IL2(norm)={val:.4f}{br_txt}')
             self._update_plot()
         except Exception as e:
             messagebox.showerror('Fit error', str(e))
@@ -1544,6 +2029,8 @@ class LEdgeNormApp(tk.Tk):
         self._set_status(f'Running {n_mc} Monte Carlo fits…')
 
         fixed = self._get_fixed()
+        static_constraints = self._get_static_constraints()
+        global_init = self._global_init_var.get()
 
         def _worker():
             def _cb(done, total):
@@ -1562,7 +2049,9 @@ class LEdgeNormApp(tk.Tk):
                 self._x_sum, self._y_sum, d0, peaks,
                 n=n_mc, spread=spr, fixed=fixed, br=self._get_br(),
                 cb=_cb, stop_event=self._stop_event,
-                live_cb=_live, live_every=10)
+                live_cb=_live, live_every=10,
+                static_constraints=static_constraints,
+                global_init=global_init)
             self.after(0, lambda: self._on_mc_done(fits))
 
         threading.Thread(target=_worker, daemon=True).start()
@@ -1617,12 +2106,16 @@ class LEdgeNormApp(tk.Tk):
         r2     = self._model.r2(mu_d, mu_pk, self._x_sum, self._y_sum, br=br)
         c2     = self._model.chi2_vec(
             self._model.pack(mu_d, mu_pk), self._x_sum, self._y_sum, mu_pk, br=br)
+        br_now = self._model.branch_ratio(mu_pk)
 
         # Build MC result text
         lines = [f'n fits : {len(fits)}',
                  f'chi2   : {c2:.4g}',
                  f'r²     : {r2:.5f}',
                  f'IL3+2IL2(norm): {val:.4f}',
+                 (f'BR     : {br_now:.4f}  (target {br:.4f})'
+                  if br is not None and np.isfinite(br_now)
+                  else ''),
                  '',
                  'Peak means ± sd:']
         kind_count = {}
@@ -1706,7 +2199,7 @@ class LEdgeNormApp(tk.Tk):
             for comp_key, arr in comp.items():
                 if not comp_key.startswith('p'):
                     continue
-                # key format: pL3_0, pL2_1, pMLCT_0, pLMCT_0
+                # key format: pL3_0, pL3_MLCT_0, pL2_LMCT_1
                 # strip leading 'p'
                 rest = comp_key[1:]           # e.g. "L3_0", "MLCT_0"
                 parts = rest.rsplit('_', 1)
@@ -1838,20 +2331,26 @@ class LEdgeNormApp(tk.Tk):
         if not path:
             return
         try:
+            static_constraints = self._param_panel.get_constraints()
             with open(path, 'w', newline='') as f:
                 w = csv.writer(f)
                 w.writerow(['# L-Edge XAS Fit Parameters'])
                 w.writerow(['# Generated by ledge_normalizer.py'])
-                w.writerow(['parameter', 'value', 'std_dev', 'section', 'label'])
+                w.writerow(['parameter', 'value', 'std_dev', 'section', 'label',
+                            'lock', 'lo', 'hi'])
                 # Static params
                 for p in PARAMS_STATIC:
                     key, sec, lbl = p[0], p[1], p[2]
                     val  = d[key]
                     sd   = (self._mc_std_d[key]
                             if self._mc_std_d and key in self._mc_std_d else '')
+                    spec = static_constraints.get(key, {'lock': p[7], 'lo': p[4], 'hi': p[5]})
                     w.writerow([key, f'{val:.8g}',
                                 f'{sd:.6g}' if sd != '' else '',
-                                sec, lbl])
+                                sec, lbl,
+                                int(bool(spec.get('lock', False))),
+                                f'{float(spec.get("lo", p[4])):.8g}',
+                                f'{float(spec.get("hi", p[5])):.8g}'])
                 # Peaks
                 for i, pk in enumerate(peaks):
                     kind  = pk['kind']
@@ -1863,16 +2362,79 @@ class LEdgeNormApp(tk.Tk):
                         key = f'peak{i+1}_{kind}_{field}'
                         val = pk[field]
                         sd  = sd_pk.get(field, '')
+                        field_cons = ((pk.get('constraints') or {}).get(field) or
+                                      {'lock': False,
+                                       'lo': PEAK_BOUNDS[kind][field][0],
+                                       'hi': PEAK_BOUNDS[kind][field][1]})
                         w.writerow([key, f'{val:.8g}',
                                     f'{sd:.6g}' if sd != '' else '',
-                                    f'{kind} Peak #{i+1}', f'{enb}  {field}'])
+                                    f'{kind} Peak #{i+1}', f'{enb}  {field}',
+                                    int(bool(field_cons.get('lock', False))),
+                                    f'{float(field_cons.get("lo", PEAK_BOUNDS[kind][field][0])):.8g}',
+                                    f'{float(field_cons.get("hi", PEAK_BOUNDS[kind][field][1])):.8g}'])
             self._set_status(f'Parameters saved: {os.path.basename(path)}')
+        except Exception as e:
+            messagebox.showerror('Save error', str(e))
+
+    def _save_quanty_bundle(self):
+        if self._x_sum is None:
+            messagebox.showwarning('No data', 'Load and sum data before exporting.')
+            return
+
+        d = self._param_panel.get_params()
+        peaks = self._peak_panel.get_peaks()
+        path = filedialog.asksaveasfilename(
+            title='Save Quanty seed bundle',
+            defaultextension='.json',
+            filetypes=[('JSON', '*.json'), ('All', '*.*')])
+        if not path:
+            return
+
+        try:
+            br = self._get_br()
+            fit_metrics = self._collect_fit_metrics(d, peaks, br=br)
+            written = write_quanty_seed_bundle(
+                path,
+                element=self._element_var.get(),
+                zeta_2p=self._model.zeta,
+                params=d,
+                peaks=peaks,
+                symmetry=self._symmetry_var.get(),
+                br=br,
+                mc_std_d=self._mc_std_d,
+                mc_std_pk=self._mc_std_pk,
+                fit_metrics=fit_metrics,
+            )
+            names = ', '.join(os.path.basename(p) for p in written)
+            self._set_status(f'Quanty seed bundle saved: {names}')
         except Exception as e:
             messagebox.showerror('Save error', str(e))
 
     # ══════════════════════════════════════════════════════════════════════
     #  Helpers
     # ══════════════════════════════════════════════════════════════════════
+
+    def _collect_fit_metrics(self, d, peaks, br=None):
+        metrics = {}
+        try:
+            metrics['r2'] = float(self._model.r2(d, peaks, self._x_sum, self._y_sum, br=br))
+        except Exception:
+            pass
+        try:
+            metrics['sse'] = float(self._model.chi2_vec(
+                self._model.pack(d, peaks), self._x_sum, self._y_sum, peaks, br=br))
+        except Exception:
+            pass
+        try:
+            metrics['normalized_peak_area'] = float(
+                self._model.il3_plus_2il2_norm(d, peaks, br=br))
+        except Exception:
+            pass
+        try:
+            metrics['y_scale_factor'] = float(self._y_scale)
+        except Exception:
+            pass
+        return metrics
 
     def _set_status(self, msg):
         self._status_var.set(msg)
@@ -1886,7 +2448,10 @@ class LEdgeNormApp(tk.Tk):
             'transition-metal L2,3-edge XAS.\n\n'
             'Four-domain background B(x), cumulative pseudo-Voigt edge\n'
             'steps (2:1 L3:L2 branching ratio), dynamic pseudo-Voigt\n'
-            'peaks (L3 / L2 / MLCT / LMCT), Monte Carlo error estimation.\n\n'
+            'peaks (L3 / L2 plus edge-resolved MLCT / LMCT),\n'
+            'Monte Carlo error estimation,\n'
+            'and Quanty seed export for crystal-field / ligand-field work,\n'
+            'including lower-symmetry scaffolds such as C2v.\n\n'
             'Normalization:  μ_norm = (μ_raw − B) / (3/2 · IL3,Edge)\n\n'
             'Lock E0 is ON by default to prevent catastrophic drift\n'
             'during Monte Carlo fitting.\n\n'
