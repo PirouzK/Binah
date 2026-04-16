@@ -747,6 +747,230 @@ class ExperimentalParser:
         except Exception:
             return None
 
+    # ── Channel preview (raw data for display before import) ─────────────────
+
+    def preview_channels(self, filepath: str) -> list:
+        """
+        Detect every meaningful signal channel in a .dat file and return them
+        for visual preview before the user commits to importing.
+
+        Returns a list of (display_name, kind, energy_array, signal_array)
+        where kind ∈ {'tey', 'fluorescence', 'transmission', 'reference'}.
+        Signals are min-shifted (not normalised) so the spectral shape is clear.
+        """
+        try:
+            if self.is_sxrmb(filepath):
+                return self._preview_sxrmb_channels(filepath)
+            else:
+                return self._preview_bioxas_channels(filepath)
+        except Exception:
+            return []
+
+    def _preview_sxrmb_channels(self, filepath: str) -> list:
+        """Extract preview channels from a CLS SXRMB .dat file."""
+        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+
+        col_header_line = ""
+        data_start = 0
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s.startswith("#"):
+                data_start = i
+                break
+            body = s.lstrip("#").strip()
+            if body and not body.startswith("-"):
+                col_header_line = body
+
+        col_names = [c.strip() for c in col_header_line.split("\t") if c.strip()]
+
+        data_rows = []
+        for line in lines[data_start:]:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            try:
+                vals = [float(v) for v in s.split()]
+                if vals:
+                    data_rows.append(vals)
+            except ValueError:
+                continue
+
+        if not data_rows:
+            return []
+
+        data = np.array(data_rows)
+
+        def _col(names):
+            for name in names:
+                for j, c in enumerate(col_names):
+                    if name.lower() in c.lower():
+                        return j
+            return None
+
+        def _get(idx):
+            return data[:, idx].copy() if (idx is not None and idx < data.shape[1]) else None
+
+        i_energy = _col(["EnergyFeedback.X", "EnergyFeedback"])
+        i_i0     = _col(["BeamlineI0Detector", "I0"])
+        i_tey    = _col(["norm_TEYDetector", "TEYDetector"])
+        i_fluor  = _col(["norm_ClKa1", "norm_SKa1", "norm_PKa1",
+                          "norm_NiKa1", "norm_TiKa1", "norm_FeKa1",
+                          "norm_CuKa1", "norm_ZnKa1", "norm_MnKa1"])
+        if i_fluor is None:
+            i_fluor = _col(["ClKa1", "SKa1", "PKa1", "NiKa1", "TiKa1",
+                             "FeKa1", "CuKa1", "ZnKa1", "MnKa1"])
+        i_i2 = _col(self._I2_COLS)
+
+        energy = _get(i_energy)
+        if energy is None:
+            return []
+
+        channels = []
+
+        def _norm_sig(raw_col):
+            """Divide by I0 if available, then min-shift."""
+            sig = _get(raw_col)
+            if sig is None:
+                return None
+            if i_i0 is not None and "norm_" not in col_names[raw_col].lower():
+                i0v = _get(i_i0)
+                if i0v is not None:
+                    i0v = np.where(np.abs(i0v) < 1e-9, 1.0, i0v)
+                    sig = sig / i0v
+            sig = sig - sig.min()
+            return sig
+
+        if i_tey is not None:
+            sig = _norm_sig(i_tey)
+            if sig is not None:
+                channels.append(("TEY", "tey", energy.copy(), sig))
+
+        if i_fluor is not None:
+            fluor_col_name = col_names[i_fluor]
+            sig = _norm_sig(i_fluor)
+            if sig is not None:
+                channels.append((f"Fluorescence  ({fluor_col_name})",
+                                  "fluorescence", energy.copy(), sig))
+
+        if i_i0 is not None and i_i2 is not None:
+            i0v = _get(i_i0)
+            i2v = _get(i_i2)
+            if i0v is not None and i2v is not None:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    ratio  = np.where((i0v > 0) & (i2v > 0), i0v / i2v, np.nan)
+                    ref_mu = np.where(
+                        np.isfinite(ratio) & (ratio > 0), np.log(ratio), np.nan)
+                mask = np.isfinite(ref_mu)
+                if mask.sum() > 3:
+                    channels.append(("Reference  ln(I\u2080/I\u2082)",
+                                      "reference",
+                                      energy[mask].copy(), ref_mu[mask]))
+
+        return channels
+
+    def _preview_bioxas_channels(self, filepath: str) -> list:
+        """Extract preview channels from a BioXAS XDI .dat file."""
+        with open(filepath, encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+
+        col_map: Dict[int, str] = {}
+        for line in lines:
+            s = line.strip()
+            if not s.startswith("#"):
+                break
+            m = re.match(r"#\s*Column\.(\d+):\s*(.+)", s)
+            if m:
+                col_map[int(m.group(1))] = m.group(2).strip()
+
+        energy_col = self._find_col(col_map, ["energy", "eV"], required=True)
+        i0_col     = self._find_col(col_map, ["I0", "I0Detector"])
+        i1_col     = self._find_col(col_map, ["I1", "I1Detector"])
+        inb_col    = self._find_col(col_map, ["InB_DarkCorrect", "NiKa1_InB"])
+        outb_col   = self._find_col(col_map, ["OutB_DarkCorrect", "NiKa1_OutB"])
+        # BioXAS rarely has a dedicated I2 but check anyway
+        i2_col_name = None
+        for v in col_map.values():
+            if any(k.lower() in v.lower() for k in self._I2_COLS):
+                i2_col_name = v
+                break
+
+        data_rows = []
+        for line in lines:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            parts = s.split("\t")
+            try:
+                data_rows.append([float(p) if p.strip() else 0.0 for p in parts])
+            except ValueError:
+                continue
+
+        if not data_rows:
+            return []
+
+        arr = np.array(data_rows, dtype=float)
+
+        def col(idx):
+            c = idx - 1
+            return arr[:, c].copy() if (idx and 0 <= c < arr.shape[1]) else None
+
+        energy = col(energy_col)
+        if energy is None:
+            return []
+
+        channels = []
+
+        # Fluorescence: (InB + OutB) / I0
+        if inb_col and outb_col:
+            fluor = col(inb_col) + col(outb_col)
+        elif inb_col:
+            fluor = col(inb_col)
+        else:
+            fluor = None
+
+        if fluor is not None:
+            i0v = col(i0_col) if i0_col else None
+            if i0v is not None:
+                i0v = np.where(np.abs(i0v) < 1e-9, 1.0, i0v)
+                fluor = fluor / i0v
+            fluor = fluor - fluor.min()
+            channels.append(("Fluorescence  (InB + OutB) / I\u2080",
+                              "fluorescence", energy.copy(), fluor))
+
+        # Transmission: ln(I0/I1)
+        if i0_col and i1_col:
+            i0v = col(i0_col)
+            i1v = col(i1_col)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                trans = np.where((i0v > 0) & (i1v > 0),
+                                 np.log(i0v / i1v), np.nan)
+            mask = np.isfinite(trans)
+            if mask.sum() > 3:
+                channels.append(("Transmission  ln(I\u2080/I\u2081)",
+                                  "transmission",
+                                  energy[mask].copy(), trans[mask]))
+
+        # Reference: ln(I0/I2) if I2 present
+        if i0_col and i2_col_name:
+            i2_idx = next((k for k, v in col_map.items()
+                           if v == i2_col_name), None)
+            if i2_idx:
+                i0v = col(i0_col)
+                i2v = col(i2_idx)
+                if i0v is not None and i2v is not None:
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        ratio  = np.where((i0v > 0) & (i2v > 0), i0v / i2v, np.nan)
+                        ref_mu = np.where(
+                            np.isfinite(ratio) & (ratio > 0), np.log(ratio), np.nan)
+                    mask = np.isfinite(ref_mu)
+                    if mask.sum() > 3:
+                        channels.append(("Reference  ln(I\u2080/I\u2082)",
+                                          "reference",
+                                          energy[mask].copy(), ref_mu[mask]))
+
+        return channels
+
     def parse_any(self, filepath: str, **kwargs) -> List[ExperimentalScan]:
         """Auto-detect format and return a list of scans."""
         ext = os.path.splitext(filepath)[1].lower()
