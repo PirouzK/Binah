@@ -626,6 +626,127 @@ class ExperimentalParser:
             pass
         return False
 
+    # ── ln(I₀/I₂) reference helpers ──────────────────────────────────────────
+
+    # Column-name candidates for I0 and I2 channels.
+    _I0_COLS = ["BeamlineI0Detector", "I0Detector", "I0", "I_0"]
+    _I2_COLS = ["I2Detector", "I_2", "I2"]
+
+    def _read_dat_raw_columns(self, filepath: str):
+        """
+        Read a # header + whitespace-data .dat file and locate energy, I0 and
+        I2 column indices.  Returns (col_names, i_energy, i_i0, i_i2, data_np)
+        or None if the file cannot be parsed.
+        """
+        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+
+        col_header_line = ""
+        data_start = 0
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s.startswith("#"):
+                data_start = i
+                break
+            body = s.lstrip("#").strip()
+            if body and not body.startswith("-"):
+                col_header_line = body
+
+        col_names = [c.strip() for c in col_header_line.split("\t") if c.strip()]
+        if not col_names:
+            col_names = col_header_line.split()
+
+        data_rows = []
+        for line in lines[data_start:]:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            try:
+                vals = [float(v) for v in s.split()]
+                if vals:
+                    data_rows.append(vals)
+            except ValueError:
+                continue
+
+        if not data_rows:
+            return None
+
+        data = np.array(data_rows)
+
+        def _find(candidates):
+            for name in candidates:
+                for j, c in enumerate(col_names):
+                    if name.lower() in c.lower():
+                        return j
+            return None
+
+        i_energy = _find(["EnergyFeedback.X", "EnergyFeedback",
+                           "energy", "Energy", "eV"])
+        i_i0     = _find(self._I0_COLS)
+        i_i2     = _find(self._I2_COLS)
+        return col_names, i_energy, i_i0, i_i2, data
+
+    def peek_i0_i2(self, filepath: str) -> Tuple[bool, bool, str, str]:
+        """
+        Quick peek at column headers.
+        Returns (has_i0, has_i2, i0_colname, i2_colname).
+        """
+        try:
+            result = self._read_dat_raw_columns(filepath)
+            if result is None:
+                return False, False, "", ""
+            col_names, _, i_i0, i_i2, _ = result
+            i0_name = col_names[i_i0] if i_i0 is not None else ""
+            i2_name = col_names[i_i2] if i_i2 is not None else ""
+            return (i_i0 is not None), (i_i2 is not None), i0_name, i2_name
+        except Exception:
+            return False, False, "", ""
+
+    def extract_reference_scan(self, filepath: str) -> Optional[ExperimentalScan]:
+        """
+        Compute ln(I₀/I₂) from a .dat file and return it as an ExperimentalScan.
+        Returns None when I0 or I2 columns are absent or the file cannot be read.
+        """
+        try:
+            result = self._read_dat_raw_columns(filepath)
+            if result is None:
+                return None
+            col_names, i_energy, i_i0, i_i2, data = result
+            if i_energy is None or i_i0 is None or i_i2 is None:
+                return None
+
+            energy = data[:, i_energy]
+            i0     = data[:, i_i0]
+            i2     = data[:, i_i2]
+
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio  = np.where((i0 > 0) & (i2 > 0), i0 / i2, np.nan)
+                ref_mu = np.where(np.isfinite(ratio) & (ratio > 0),
+                                  np.log(ratio), np.nan)
+
+            mask = np.isfinite(ref_mu)
+            energy_clean = energy[mask]
+            mu_clean     = ref_mu[mask]
+
+            if len(energy_clean) < 3:
+                return None
+
+            basename = os.path.splitext(os.path.basename(filepath))[0]
+            i0_name  = col_names[i_i0]
+            i2_name  = col_names[i_i2]
+
+            return ExperimentalScan(
+                label=f"{basename}  ln(I\u2080/I\u2082)",
+                source_file=filepath,
+                energy_ev=energy_clean,
+                mu=mu_clean,
+                e0=0.0,
+                is_normalized=False,
+                scan_type=f"reference  ln({i0_name}/{i2_name})",
+            )
+        except Exception:
+            return None
+
     def parse_any(self, filepath: str, **kwargs) -> List[ExperimentalScan]:
         """Auto-detect format and return a list of scans."""
         ext = os.path.splitext(filepath)[1].lower()
