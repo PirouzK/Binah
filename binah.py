@@ -26,7 +26,7 @@ except ImportError:
     )
     sys.exit(1)
 
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 try:
     from sgm_xas_loader import SGMLoaderApp as _SGMLoaderApp
@@ -109,6 +109,8 @@ class OrcaTDDFTApp(tk.Tk):
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="FEFF Setup / Update...",
                               command=self._launch_feff_setup)
+        help_menu.add_command(label="Build Parallel FEFF10 (MPI)...",
+                              command=self._launch_feff_parallel_build)
         help_menu.add_separator()
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -182,13 +184,13 @@ class OrcaTDDFTApp(tk.Tk):
         ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
         tk.Button(
-            sidebar, text="+ Add to Overlay", bg="#003d7a", fg="white",
+            sidebar, text="+ Add to Overlay", bg="#003d7a", fg="black",
             activebackground="#0055aa", font=("", 9, "bold"),
             command=self._add_current_to_overlay
         ).pack(fill=tk.X, padx=4, pady=(0, 2))
 
         tk.Button(
-            sidebar, text="Load Exp. Data\u2026", bg="#6B0000", fg="white",
+            sidebar, text="Load Exp. Data\u2026", bg="#6B0000", fg="black",
             activebackground="#8B0000", font=("", 9, "bold"),
             command=self._load_experimental
         ).pack(fill=tk.X, padx=4, pady=(0, 2))
@@ -299,7 +301,7 @@ class OrcaTDDFTApp(tk.Tk):
             hdr,
             text="Managed FEFF Setup",
             bg="#003366",
-            fg="white",
+            fg="black",
             font=("", 11, "bold"),
         ).pack(anchor="w")
         tk.Label(
@@ -410,6 +412,154 @@ class OrcaTDDFTApp(tk.Tk):
                 self._append_feff_setup_log(
                     "You can retry later from Help -> FEFF Setup / Update."
                 )
+
+    # ------------------------------------------------------------------ #
+    #  Parallel (MPI) FEFF build                                          #
+    # ------------------------------------------------------------------ #
+    def _launch_feff_parallel_build(self):
+        win = getattr(self, "_feff_par_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            return
+
+        # Ask for desired process count first.
+        default_n = max(2, (os.cpu_count() or 4) // 2)
+        n_str = simpledialog.askstring(
+            "Build Parallel FEFF10",
+            "Number of MPI processes to use by default\n"
+            f"(detected {os.cpu_count() or '?'} logical CPUs):",
+            initialvalue=str(default_n),
+            parent=self,
+        )
+        if n_str is None:
+            return
+        try:
+            n_procs = max(1, int(n_str.strip()))
+        except (ValueError, AttributeError):
+            messagebox.showerror("Invalid input",
+                                 "Process count must be a positive integer.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Build Parallel FEFF10 (MPI)")
+        win.geometry("760x430")
+        win.minsize(620, 320)
+        win.transient(self)
+
+        hdr = tk.Frame(win, bg="#003366", padx=12, pady=10)
+        hdr.pack(fill=tk.X)
+        tk.Label(
+            hdr, text="MPI Parallel FEFF10 Build", bg="#003366", fg="black",
+            font=("", 11, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text=(
+                f"Compiling MPI variant of FEFF10 to mod/win64_par/. "
+                f"Default processes: {n_procs} (override with FEFF_NPROC env var)."
+            ),
+            bg="#003366", fg="#d7e7ff", wraplength=700, justify="left",
+            font=("", 9),
+        ).pack(anchor="w", pady=(4, 0))
+
+        body = tk.Frame(win, padx=10, pady=8)
+        body.pack(fill=tk.BOTH, expand=True)
+        self._feff_par_log = tk.Text(body, font=("Courier", 8), wrap=tk.WORD)
+        self._feff_par_log.pack(fill=tk.BOTH, expand=True)
+        self._feff_par_log.insert(
+            tk.END,
+            f"Starting MPI build with {n_procs} default processes ...\n\n",
+        )
+        self._feff_par_log.config(state=tk.DISABLED)
+
+        footer = tk.Frame(win, padx=10, pady=8)
+        footer.pack(fill=tk.X)
+        self._feff_par_status = tk.StringVar(value="Building parallel FEFF10 ...")
+        tk.Label(footer, textvariable=self._feff_par_status, anchor="w",
+                 fg="#003366", font=("", 8)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._feff_par_close_btn = tk.Button(
+            footer, text="Close", width=12, state=tk.DISABLED,
+            command=win.destroy,
+        )
+        self._feff_par_close_btn.pack(side=tk.RIGHT)
+
+        self._feff_par_win = win
+        self._feff_par_queue = queue.Queue()
+        self._feff_par_n = n_procs
+        thread = threading.Thread(
+            target=self._run_feff_parallel_worker, daemon=True
+        )
+        thread.start()
+        self.after(120, self._poll_feff_parallel_queue)
+
+    def _append_feff_par_log(self, line: str):
+        log = getattr(self, "_feff_par_log", None)
+        if log is None:
+            return
+        log.config(state=tk.NORMAL)
+        log.insert(tk.END, line.rstrip() + "\n")
+        log.see(tk.END)
+        log.config(state=tk.DISABLED)
+
+    def _run_feff_parallel_worker(self):
+        q = self._feff_par_queue
+
+        def _log(message: str):
+            q.put(("log", message))
+
+        result = feff_manager.install_parallel_managed_feff(
+            self._cfg_path, self._feff_par_n, _log
+        )
+        q.put(("done", result))
+
+    def _poll_feff_parallel_queue(self):
+        q = getattr(self, "_feff_par_queue", None)
+        win = getattr(self, "_feff_par_win", None)
+        if q is None or win is None or not win.winfo_exists():
+            return
+
+        done = False
+        result = None
+        while True:
+            try:
+                kind, payload = q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "log":
+                self._append_feff_par_log(str(payload))
+            elif kind == "done":
+                done = True
+                result = payload
+
+        if not done:
+            self.after(120, self._poll_feff_parallel_queue)
+            return
+
+        self._feff_par_close_btn.config(state=tk.NORMAL)
+
+        if result and result.get("ok"):
+            exe = str(result.get("exe_path", "")).strip()
+            self._feff_par_status.set("Parallel FEFF10 build complete.")
+            self._append_feff_par_log("")
+            self._append_feff_par_log(f"Wrapper: {exe}")
+            self._append_feff_par_log(
+                "To use it, point the EXAFS tab's FEFF executable field at this wrapper."
+            )
+            if exe and hasattr(self, "_exafs_tab"):
+                if messagebox.askyesno(
+                    "Use Parallel FEFF?",
+                    "Parallel FEFF10 build succeeded. Use the parallel wrapper "
+                    "in the EXAFS tab now?",
+                    parent=win,
+                ):
+                    self._exafs_tab._feff_exe_var.set(exe)
+        else:
+            msg = "Parallel FEFF10 build failed."
+            self._feff_par_status.set(msg)
+            if result and result.get("message"):
+                self._append_feff_par_log("")
+                self._append_feff_par_log(f"Result: {result['message']}")
 
     # ------------------------------------------------------------------ #
     #  ORCA file operations                                                 #
@@ -580,7 +730,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr = tk.Frame(win, bg="#003366", pady=6)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="CLS SXRMB Beamline Import",
-                 font=("", 11, "bold"), bg="#003366", fg="white").pack(padx=12)
+                 font=("", 11, "bold"), bg="#003366", fg="black").pack(padx=12)
         tk.Label(hdr, text=os.path.basename(path),
                  font=("", 8), bg="#003366", fg="#AACCFF").pack(padx=12)
 
@@ -623,7 +773,7 @@ class OrcaTDDFTApp(tk.Tk):
                                      f"Failed to load SXRMB file:\n{e}")
                 self._status.set("Error loading SXRMB file.")
 
-        tk.Button(btn_row, text="Load", width=12, bg="#003366", fg="white",
+        tk.Button(btn_row, text="Load", width=12, bg="#003366", fg="black",
                   activebackground="#0055aa", command=do_load).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Cancel", width=10,
                   command=win.destroy).pack(side=tk.LEFT, padx=4)
@@ -639,7 +789,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr = tk.Frame(win, bg="#6B0000", padx=12, pady=8)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="BioXAS XDI Import Options",
-                 bg="#6B0000", fg="white", font=("", 11, "bold")).pack(anchor="w")
+                 bg="#6B0000", fg="black", font=("", 11, "bold")).pack(anchor="w")
         tk.Label(hdr, text=os.path.basename(path),
                  bg="#6B0000", fg="#ffaaaa", font=("", 9)).pack(anchor="w")
 
@@ -684,7 +834,7 @@ class OrcaTDDFTApp(tk.Tk):
 
         btn_row = tk.Frame(win)
         btn_row.pack(pady=(0, 10))
-        tk.Button(btn_row, text="Load", width=12, bg="#6B0000", fg="white",
+        tk.Button(btn_row, text="Load", width=12, bg="#6B0000", fg="black",
                   activebackground="#8B0000", command=do_load).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Cancel", width=10,
                   command=win.destroy).pack(side=tk.LEFT, padx=4)
@@ -726,7 +876,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr = tk.Frame(win, bg="#6B0000", padx=12, pady=8)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="Athena Project — Select Scans to Load",
-                 bg="#6B0000", fg="white", font=("", 11, "bold")).pack(anchor="w")
+                 bg="#6B0000", fg="black", font=("", 11, "bold")).pack(anchor="w")
         tk.Label(hdr, text=f"{len(scans)} scan groups found  |  {os.path.basename(path)}",
                  bg="#6B0000", fg="#ffaaaa", font=("", 9)).pack(anchor="w")
 
@@ -775,7 +925,7 @@ class OrcaTDDFTApp(tk.Tk):
             )
 
         tk.Button(btn_row, text="Load Selected", width=14,
-                  bg="#6B0000", fg="white", activebackground="#8B0000",
+                  bg="#6B0000", fg="black", activebackground="#8B0000",
                   command=do_load).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Select All",  width=10,
                   command=lambda: lb.selection_set(0, tk.END)).pack(side=tk.LEFT, padx=4)
@@ -830,7 +980,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr.pack(fill=tk.X)
         tk.Label(
             hdr, text="No TDDFT Spectrum Data Found",
-            bg="#8B0000", fg="white", font=("", 11, "bold")
+            bg="#8B0000", fg="black", font=("", 11, "bold")
         ).pack(anchor="w")
         tk.Label(
             hdr, text=os.path.basename(path),

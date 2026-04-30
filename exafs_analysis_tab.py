@@ -61,6 +61,18 @@ def _coerce_float(value, default: float = 0.0) -> float:
         return float(default)
 
 
+def _parse_optional_radius(value) -> float | None:
+    """Parse a radius entry: empty/blank -> None, valid number -> float."""
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        r = float(text)
+    except Exception:
+        return None
+    return r if r > 0 else None
+
+
 def _next_pow_two(value: int) -> int:
     out = 1
     while out < value:
@@ -635,7 +647,44 @@ class EXAFSAnalysisTab(tk.Frame):
         self._xyz_edge_var = tk.StringVar(value="K")
         self._xyz_spectrum_var = tk.StringVar(value="EXAFS")
         self._xyz_kmesh_var = tk.IntVar(value=200)
+        # Molecular mode: skip CIF/RECIPROCAL/KMESH and emit a real-space ATOMS
+        # card. Drastically faster for isolated molecules and almost always the
+        # right choice for XYZ-derived inputs.
+        self._xyz_molecular_mode_var = tk.BooleanVar(value=True)
+        # Cluster radius (Å): empty = include all atoms; >0 = crop to a sphere
+        # around the absorber and tag the output filenames with the radius.
+        self._xyz_cluster_radius_var = tk.StringVar(value="")
         self._xyz_equiv_var = tk.IntVar(value=2)
+        self._xyz_xanes_emin_var = tk.DoubleVar(value=-30.0)
+        self._xyz_xanes_emax_var = tk.DoubleVar(value=250.0)
+        self._xyz_xanes_estep_var = tk.DoubleVar(value=0.25)
+        # Advanced FEFF options (exposed in pop-out dialog)
+        self._xyz_s02_var = tk.DoubleVar(value=1.0)
+        self._xyz_corehole_var = tk.StringVar(value="RPA")
+        self._xyz_exchange_var = tk.IntVar(value=0)
+        self._xyz_exchange_vr_var = tk.DoubleVar(value=0.0)
+        self._xyz_exchange_vi_var = tk.DoubleVar(value=0.0)
+        self._xyz_scf_radius_var = tk.DoubleVar(value=4.0)
+        self._xyz_scf_nscf_var = tk.IntVar(value=30)
+        self._xyz_scf_ca_var = tk.DoubleVar(value=0.2)
+        self._xyz_fms_radius_var = tk.DoubleVar(value=6.0)
+        self._xyz_rpath_var = tk.DoubleVar(value=8.0)
+        self._xyz_nleg_var = tk.IntVar(value=0)
+        self._xyz_exafs_kmax_var = tk.DoubleVar(value=20.0)
+        self._xyz_multipole_lmax_var = tk.IntVar(value=0)
+        self._xyz_multipole_iorder_var = tk.IntVar(value=2)
+        self._xyz_polarization_var = tk.BooleanVar(value=False)
+        self._xyz_pol_x_var = tk.DoubleVar(value=1.0)
+        self._xyz_pol_y_var = tk.DoubleVar(value=0.0)
+        self._xyz_pol_z_var = tk.DoubleVar(value=0.0)
+        self._xyz_ellip_var = tk.BooleanVar(value=False)
+        self._xyz_ellip_val_var = tk.DoubleVar(value=0.0)
+        self._xyz_ellip_x_var = tk.DoubleVar(value=0.0)
+        self._xyz_ellip_y_var = tk.DoubleVar(value=0.0)
+        self._xyz_ellip_z_var = tk.DoubleVar(value=1.0)
+        self._xyz_debye_var = tk.BooleanVar(value=False)
+        self._xyz_debye_temp_var = tk.DoubleVar(value=300.0)
+        self._xyz_debye_dtemp_var = tk.DoubleVar(value=400.0)
 
         tk.Label(top, text="Workdir:", font=("", 8, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Entry(top, textvariable=self._feff_dir_var, width=52).grid(
@@ -661,6 +710,10 @@ class EXAFSAnalysisTab(tk.Frame):
         tk.Label(top, textvariable=self._feff_info_var, fg="#003366",
                  font=("", 8)).grid(row=2, column=0, columnspan=4,
                                     sticky="w", pady=(5, 0))
+        self._feff_status_var = tk.StringVar(value="")
+        tk.Label(top, textvariable=self._feff_status_var, fg="#7B3F00",
+                 font=("", 8, "italic")).grid(row=3, column=0, columnspan=4,
+                                              sticky="w")
         top.columnconfigure(1, weight=1)
 
         xyz_box = tk.LabelFrame(parent, text="XYZ -> FEFF Bundle", padx=5, pady=4)
@@ -723,27 +776,59 @@ class EXAFSAnalysisTab(tk.Frame):
             width=10,
         ).grid(row=2, column=5, sticky="w", padx=4, pady=(4, 0))
 
-        tk.Label(xyz_box, text="KMESH:", font=("", 8, "bold")).grid(
-            row=3, column=0, sticky="w", pady=(4, 0)
+        ttk.Checkbutton(
+            xyz_box, text="Molecular mode (real-space ATOMS, much faster)",
+            variable=self._xyz_molecular_mode_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        tk.Label(xyz_box, text="Cluster (Å):", font=("", 8)).grid(
+            row=3, column=3, sticky="e", pady=(4, 0)
         )
-        ttk.Entry(xyz_box, textvariable=self._xyz_kmesh_var, width=8).grid(
-            row=3, column=1, sticky="w", padx=4, pady=(4, 0)
+        ttk.Entry(xyz_box, textvariable=self._xyz_cluster_radius_var, width=6).grid(
+            row=3, column=4, sticky="w", padx=4, pady=(4, 0)
         )
-        tk.Label(xyz_box, text="Equivalence:", font=("", 8, "bold")).grid(
-            row=3, column=2, sticky="e", pady=(4, 0)
+        tk.Label(xyz_box, text="KMESH:", font=("", 8)).grid(
+            row=3, column=5, sticky="e", pady=(4, 0)
         )
-        ttk.Entry(xyz_box, textvariable=self._xyz_equiv_var, width=8).grid(
-            row=3, column=3, sticky="w", padx=4, pady=(4, 0)
+        ttk.Entry(xyz_box, textvariable=self._xyz_kmesh_var, width=6).grid(
+            row=3, column=6, sticky="w", padx=4, pady=(4, 0)
         )
+        tk.Label(xyz_box, text="Equivalence:", font=("", 8)).grid(
+            row=3, column=7, sticky="e", pady=(4, 0)
+        )
+        ttk.Entry(xyz_box, textvariable=self._xyz_equiv_var, width=6).grid(
+            row=3, column=8, sticky="w", padx=4, pady=(4, 0)
+        )
+        btn_frame = tk.Frame(xyz_box)
+        btn_frame.grid(row=3, column=9, columnspan=2, sticky="ew", padx=(8, 0), pady=(4, 0))
         tk.Button(
-            xyz_box,
-            text="Write FEFF Bundle",
-            font=("", 8, "bold"),
-            bg="#003366",
-            fg="white",
-            activebackground="#004C99",
+            btn_frame, text="FEFF Options...", font=("", 8),
+            command=self._open_feff_options,
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(
+            btn_frame, text="Write FEFF Bundle", font=("", 8, "bold"),
+            bg="#003366", fg="white", activebackground="#004C99",
             command=self._write_xyz_feff_bundle,
-        ).grid(row=3, column=4, columnspan=2, sticky="ew", padx=(8, 0), pady=(4, 0))
+        ).pack(side=tk.LEFT)
+
+        tk.Label(xyz_box, text="XANES E min (eV):", font=("", 8, "bold")).grid(
+            row=4, column=0, sticky="w", pady=(4, 0)
+        )
+        ttk.Entry(xyz_box, textvariable=self._xyz_xanes_emin_var, width=8).grid(
+            row=4, column=1, sticky="w", padx=4, pady=(4, 0)
+        )
+        tk.Label(xyz_box, text="E max (eV):", font=("", 8, "bold")).grid(
+            row=4, column=2, sticky="e", pady=(4, 0)
+        )
+        ttk.Entry(xyz_box, textvariable=self._xyz_xanes_emax_var, width=8).grid(
+            row=4, column=3, sticky="w", padx=4, pady=(4, 0)
+        )
+        tk.Label(xyz_box, text="Step (eV):", font=("", 8, "bold")).grid(
+            row=4, column=4, sticky="e", pady=(4, 0)
+        )
+        ttk.Entry(xyz_box, textvariable=self._xyz_xanes_estep_var, width=8).grid(
+            row=4, column=5, sticky="w", padx=4, pady=(4, 0)
+        )
 
         tk.Label(
             xyz_box,
@@ -751,12 +836,19 @@ class EXAFSAnalysisTab(tk.Frame):
             fg="#003366",
             font=("", 8),
             justify="left",
-        ).grid(row=4, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
         xyz_box.columnconfigure(1, weight=1)
         xyz_box.columnconfigure(3, weight=0)
 
-        body = tk.PanedWindow(parent, orient=tk.HORIZONTAL, sashwidth=5, sashrelief=tk.RAISED)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        # Vertical paned window: body (paths + preview) on top, log on bottom.
+        # The sash between them is user-draggable so the log area can be
+        # extended when needed for long FEFF output.
+        vbody = tk.PanedWindow(parent, orient=tk.VERTICAL,
+                               sashwidth=5, sashrelief=tk.RAISED)
+        vbody.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+
+        body = tk.PanedWindow(vbody, orient=tk.HORIZONTAL, sashwidth=5, sashrelief=tk.RAISED)
+        vbody.add(body, minsize=200, stretch="always")
 
         left = tk.Frame(body, bd=1, relief=tk.SUNKEN)
         body.add(left, minsize=260)
@@ -803,10 +895,124 @@ class EXAFSAnalysisTab(tk.Frame):
         self._toolbar_feff = NavigationToolbar2Tk(self._canvas_feff, preview_toolbar)
         self._toolbar_feff.update()
 
-        self._feff_log = tk.Text(parent, height=6, font=("Courier", 8), state=tk.DISABLED)
-        self._feff_log.pack(side=tk.BOTTOM, fill=tk.X, padx=4, pady=(3, 0))
+        # Log panel — added to the vertical paned window so the user can drag
+        # the sash above it to grow/shrink the visible log area.
+        log_frame = tk.Frame(vbody)
+        self._feff_log = tk.Text(log_frame, height=8, font=("Consolas", 10),
+                                 wrap=tk.WORD, state=tk.DISABLED)
+        log_scroll = tk.Scrollbar(log_frame, orient=tk.VERTICAL,
+                                  command=self._feff_log.yview)
+        self._feff_log.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self._feff_log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True,
+                            padx=(4, 0), pady=(3, 0))
+        vbody.add(log_frame, minsize=60, stretch="never")
 
+        self._load_feff_tab_settings()
         self._draw_empty_feff_preview()
+
+    # ------------------------------------------------------------------ #
+    #  FEFF-tab settings persistence                                       #
+    # ------------------------------------------------------------------ #
+    _CFG_PATH = os.path.join(os.path.expanduser("~"), ".binah_config.json")
+
+    def _load_feff_tab_settings(self):
+        import json
+        try:
+            if not os.path.exists(self._CFG_PATH):
+                return
+            with open(self._CFG_PATH, "r", encoding="utf-8") as fh:
+                cfg = json.load(fh)
+            saved = cfg.get("feff_tab", {})
+            if not saved:
+                return
+
+            def _str(var, key):
+                v = saved.get(key, "")
+                if v:
+                    var.set(str(v))
+
+            def _num(var, key):
+                try:
+                    var.set(type(var.get())(saved[key]))
+                except Exception:
+                    pass
+
+            def _bool(var, key):
+                try:
+                    var.set(bool(saved[key]))
+                except Exception:
+                    pass
+
+            _str(self._feff_dir_var,        "feff_dir")
+            _str(self._feff_exe_var,         "feff_exe")
+            _str(self._xyz_path_var,         "xyz_path")
+            _str(self._bundle_base_var,      "bundle_base")
+            _str(self._xyz_edge_var,         "xyz_edge")
+            _str(self._xyz_spectrum_var,     "xyz_spectrum")
+            _num(self._xyz_padding_var,      "xyz_padding")
+            _bool(self._xyz_cubic_var,       "xyz_cubic")
+            _num(self._xyz_absorber_var,     "xyz_absorber")
+            _num(self._xyz_kmesh_var,        "xyz_kmesh")
+            _num(self._xyz_equiv_var,        "xyz_equivalence")
+            _num(self._xyz_xanes_emin_var,   "xyz_xanes_emin")
+            _num(self._xyz_xanes_emax_var,   "xyz_xanes_emax")
+            _num(self._xyz_xanes_estep_var,  "xyz_xanes_estep")
+
+            if self._feff_dir_var.get().strip():
+                self._load_feff_paths(silent=True)
+            if self._xyz_path_var.get().strip():
+                self._load_xyz_structure(silent=True)
+        except Exception:
+            pass
+        self._setup_feff_persistence_traces()
+
+    def _save_feff_tab_settings(self):
+        import json
+        try:
+            cfg = {}
+            if os.path.exists(self._CFG_PATH):
+                with open(self._CFG_PATH, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+            cfg["feff_tab"] = {
+                "feff_dir":       self._feff_dir_var.get(),
+                "feff_exe":       self._feff_exe_var.get(),
+                "xyz_path":       self._xyz_path_var.get(),
+                "bundle_base":    self._bundle_base_var.get(),
+                "xyz_edge":       self._xyz_edge_var.get(),
+                "xyz_spectrum":   self._xyz_spectrum_var.get(),
+                "xyz_padding":    self._xyz_padding_var.get(),
+                "xyz_cubic":      self._xyz_cubic_var.get(),
+                "xyz_absorber":   self._xyz_absorber_var.get(),
+                "xyz_kmesh":      self._xyz_kmesh_var.get(),
+                "xyz_equivalence":self._xyz_equiv_var.get(),
+                "xyz_xanes_emin": self._xyz_xanes_emin_var.get(),
+                "xyz_xanes_emax": self._xyz_xanes_emax_var.get(),
+                "xyz_xanes_estep":self._xyz_xanes_estep_var.get(),
+            }
+            with open(self._CFG_PATH, "w", encoding="utf-8") as fh:
+                json.dump(cfg, fh, indent=2)
+        except Exception:
+            pass
+
+    def _schedule_feff_save(self, *_):
+        if hasattr(self, "_feff_save_id"):
+            try:
+                self.after_cancel(self._feff_save_id)
+            except Exception:
+                pass
+        self._feff_save_id = self.after(800, self._save_feff_tab_settings)
+
+    def _setup_feff_persistence_traces(self):
+        for var in (
+            self._feff_dir_var, self._feff_exe_var,
+            self._xyz_path_var, self._bundle_base_var,
+            self._xyz_edge_var, self._xyz_spectrum_var,
+            self._xyz_padding_var, self._xyz_cubic_var,
+            self._xyz_absorber_var, self._xyz_kmesh_var, self._xyz_equiv_var,
+            self._xyz_xanes_emin_var, self._xyz_xanes_emax_var, self._xyz_xanes_estep_var,
+        ):
+            var.trace_add("write", self._schedule_feff_save)
 
     def _draw_empty_feff_preview(self):
         self._ax_feff.clear()
@@ -1373,6 +1579,134 @@ class EXAFSAnalysisTab(tk.Frame):
         if path:
             self._feff_exe_var.set(path)
 
+    def _open_feff_options(self):
+        win = tk.Toplevel(self)
+        win.title("FEFF10 Options")
+        win.resizable(True, True)
+        win.grab_set()
+
+        nb = ttk.Notebook(win)
+        nb.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        def _row(parent, label, widget_factory, row, col=0, tooltip=None):
+            tk.Label(parent, text=label, font=("", 8, "bold"), anchor="w").grid(
+                row=row, column=col, sticky="w", padx=(4, 2), pady=3)
+            w = widget_factory(parent)
+            w.grid(row=row, column=col + 1, sticky="w", padx=(0, 8), pady=3)
+            if tooltip:
+                tk.Label(parent, text=tooltip, fg="gray", font=("", 7),
+                         anchor="w").grid(row=row, column=col + 2, sticky="w")
+            return w
+
+        def _entry(var, width=10):
+            return lambda p: ttk.Entry(p, textvariable=var, width=width)
+
+        def _combo(var, values, width=12):
+            return lambda p: ttk.Combobox(p, textvariable=var, values=values,
+                                          state="readonly", width=width)
+
+        def _check(var, text=""):
+            return lambda p: tk.Checkbutton(p, variable=var, text=text, font=("", 8))
+
+        # ── Tab 1: Core ──────────────────────────────────────────────────────
+        t1 = tk.Frame(nb, padx=6, pady=6)
+        nb.add(t1, text="Core")
+
+        _row(t1, "S02:", _entry(self._xyz_s02_var, 8), 0,
+             tooltip="Passive electron reduction factor (0–1)")
+        _row(t1, "Core hole:", _combo(self._xyz_corehole_var,
+             ("RPA", "FMS", "HALF", "NONE"), 8), 1,
+             tooltip="RPA = full screening (recommended for XANES)")
+        tk.Label(t1, text="Exchange-correlation:", font=("", 8, "bold")).grid(
+            row=2, column=0, sticky="w", padx=4, pady=(10, 2), columnspan=3)
+        _row(t1, "Type:", _combo(self._xyz_exchange_var,
+             (0, 1, 2, 5), 6), 3,
+             tooltip="0=Hedin-Lundqvist  1=Dirac-Hara  2=ground state  5=LDA+C")
+        _row(t1, "Vr shift (eV):", _entry(self._xyz_exchange_vr_var, 8), 4,
+             tooltip="Real part of optical potential shift")
+        _row(t1, "Vi shift (eV):", _entry(self._xyz_exchange_vi_var, 8), 5,
+             tooltip="Imaginary broadening shift")
+
+        tk.Label(t1, text="Self-consistent field (SCF):", font=("", 8, "bold")).grid(
+            row=6, column=0, sticky="w", padx=4, pady=(10, 2), columnspan=3)
+        _row(t1, "SCF radius (Å):", _entry(self._xyz_scf_radius_var, 8), 7,
+             tooltip="Cluster radius for self-consistency (~1st shell)")
+        _row(t1, "Iterations:", _entry(self._xyz_scf_nscf_var, 8), 8,
+             tooltip="Max SCF iterations (default 30)")
+        _row(t1, "Mixing (ca):", _entry(self._xyz_scf_ca_var, 8), 9,
+             tooltip="Charge mixing fraction (0.1–0.5)")
+        _row(t1, "FMS radius (Å):", _entry(self._xyz_fms_radius_var, 8), 10,
+             tooltip="Full multiple scattering cluster radius")
+
+        # ── Tab 2: Spectrum ───────────────────────────────────────────────────
+        t2 = tk.Frame(nb, padx=6, pady=6)
+        nb.add(t2, text="Spectrum")
+
+        _row(t2, "RPATH (Å):", _entry(self._xyz_rpath_var, 8), 0,
+             tooltip="Max path length for EXAFS paths")
+        _row(t2, "EXAFS kmax (Å⁻¹):", _entry(self._xyz_exafs_kmax_var, 8), 1,
+             tooltip="Max k for EXAFS energy grid (EXAFS card)")
+        _row(t2, "NLEG:", _entry(self._xyz_nleg_var, 8), 2,
+             tooltip="Max path legs (0 = FEFF default; 4–8 typical)")
+
+        tk.Label(t2, text="XANES energy grid:", font=("", 8, "bold")).grid(
+            row=3, column=0, sticky="w", padx=4, pady=(10, 2), columnspan=3)
+        _row(t2, "E min (eV):", _entry(self._xyz_xanes_emin_var, 8), 4)
+        _row(t2, "E max (eV):", _entry(self._xyz_xanes_emax_var, 8), 5)
+        _row(t2, "Step (eV):", _entry(self._xyz_xanes_estep_var, 8), 6,
+             tooltip="0.1–0.5 eV typical (smaller = slower)")
+
+        # ── Tab 3: Multipole ─────────────────────────────────────────────────
+        t3 = tk.Frame(nb, padx=6, pady=6)
+        nb.add(t3, text="Multipole")
+
+        tk.Label(t3, text="Quadrupole / higher multipoles (MULTIPOLE card)",
+                 font=("", 8, "bold")).grid(row=0, column=0, columnspan=3,
+                                            sticky="w", padx=4, pady=(4, 8))
+        _row(t3, "lmax:", _combo(self._xyz_multipole_lmax_var, (0, 1, 2, 3), 6), 1,
+             tooltip="0/1=dipole only  2=+quadrupole  3=+octupole")
+        _row(t3, "iorder:", _combo(self._xyz_multipole_iorder_var, (0, 1, 2), 6), 2,
+             tooltip="Perturbation order for higher multipoles (2=default)")
+        tk.Label(t3, text="lmax=0 omits the MULTIPOLE card (pure dipole, fastest).",
+                 fg="gray", font=("", 7)).grid(row=3, column=0, columnspan=3,
+                                               sticky="w", padx=4, pady=(0, 10))
+
+        tk.Label(t3, text="Polarization (POLARIZATION card)",
+                 font=("", 8, "bold")).grid(row=4, column=0, columnspan=3,
+                                            sticky="w", padx=4, pady=(4, 4))
+        _row(t3, "Enable:", _check(self._xyz_polarization_var), 5)
+        _row(t3, "x:", _entry(self._xyz_pol_x_var, 8), 6)
+        _row(t3, "y:", _entry(self._xyz_pol_y_var, 8), 7)
+        _row(t3, "z:", _entry(self._xyz_pol_z_var, 8), 8,
+             tooltip="E-field direction vector (need not be normalised)")
+
+        tk.Label(t3, text="Ellipticity (ELLIPTICITY card)",
+                 font=("", 8, "bold")).grid(row=9, column=0, columnspan=3,
+                                            sticky="w", padx=4, pady=(10, 4))
+        _row(t3, "Enable:", _check(self._xyz_ellip_var), 10)
+        _row(t3, "ellip:", _entry(self._xyz_ellip_val_var, 8), 11,
+             tooltip="0=linear  1=circular  fractional = elliptical")
+        _row(t3, "x:", _entry(self._xyz_ellip_x_var, 8), 12)
+        _row(t3, "y:", _entry(self._xyz_ellip_y_var, 8), 13)
+        _row(t3, "z:", _entry(self._xyz_ellip_z_var, 8), 14,
+             tooltip="Propagation direction vector")
+
+        # ── Tab 4: Advanced ──────────────────────────────────────────────────
+        t4 = tk.Frame(nb, padx=6, pady=6)
+        nb.add(t4, text="Advanced")
+
+        tk.Label(t4, text="Debye-Waller via correlated Debye model (DEBYE card)",
+                 font=("", 8, "bold")).grid(row=0, column=0, columnspan=3,
+                                            sticky="w", padx=4, pady=(4, 4))
+        _row(t4, "Enable:", _check(self._xyz_debye_var), 1)
+        _row(t4, "Temperature (K):", _entry(self._xyz_debye_temp_var, 8), 2,
+             tooltip="Sample measurement temperature")
+        _row(t4, "Debye temp (K):", _entry(self._xyz_debye_dtemp_var, 8), 3,
+             tooltip="Characteristic Debye temperature of the material")
+
+        tk.Button(win, text="Close", command=win.destroy,
+                  font=("", 8)).pack(pady=(0, 8))
+
     def _browse_xyz_file(self):
         path = filedialog.askopenfilename(
             title="Select XYZ Structure",
@@ -1463,6 +1797,19 @@ class EXAFSAnalysisTab(tk.Frame):
             if not should_overwrite:
                 return
 
+        pol = (
+            (self._xyz_pol_x_var.get(), self._xyz_pol_y_var.get(), self._xyz_pol_z_var.get())
+            if self._xyz_polarization_var.get() else None
+        )
+        ellip = (
+            (self._xyz_ellip_val_var.get(), self._xyz_ellip_x_var.get(),
+             self._xyz_ellip_y_var.get(), self._xyz_ellip_z_var.get())
+            if self._xyz_ellip_var.get() else None
+        )
+        deb = (
+            (self._xyz_debye_temp_var.get(), self._xyz_debye_dtemp_var.get())
+            if self._xyz_debye_var.get() else None
+        )
         try:
             bundle = export_xyz_as_feff_bundle(
                 xyz_path,
@@ -1475,6 +1822,30 @@ class EXAFSAnalysisTab(tk.Frame):
                 spectrum=self._xyz_spectrum_var.get(),
                 kmesh=max(1, int(self._xyz_kmesh_var.get())),
                 equivalence=max(1, min(4, int(self._xyz_equiv_var.get()))),
+                xanes_emin=_coerce_float(self._xyz_xanes_emin_var.get(), -30.0),
+                xanes_emax=_coerce_float(self._xyz_xanes_emax_var.get(), 250.0),
+                xanes_estep=max(0.01, _coerce_float(self._xyz_xanes_estep_var.get(), 0.25)),
+                s02=_coerce_float(self._xyz_s02_var.get(), 1.0),
+                corehole=self._xyz_corehole_var.get(),
+                exchange=int(self._xyz_exchange_var.get()),
+                exchange_vr=_coerce_float(self._xyz_exchange_vr_var.get(), 0.0),
+                exchange_vi=_coerce_float(self._xyz_exchange_vi_var.get(), 0.0),
+                scf_radius=_coerce_float(self._xyz_scf_radius_var.get(), 4.0),
+                scf_nscf=max(1, int(self._xyz_scf_nscf_var.get())),
+                scf_ca=_coerce_float(self._xyz_scf_ca_var.get(), 0.2),
+                fms_radius=_coerce_float(self._xyz_fms_radius_var.get(), 6.0),
+                rpath=_coerce_float(self._xyz_rpath_var.get(), 8.0),
+                nleg=int(self._xyz_nleg_var.get()),
+                exafs_kmax=_coerce_float(self._xyz_exafs_kmax_var.get(), 20.0),
+                multipole_lmax=int(self._xyz_multipole_lmax_var.get()),
+                multipole_iorder=int(self._xyz_multipole_iorder_var.get()),
+                polarization=pol,
+                ellipticity=ellip,
+                debye=deb,
+                molecular_mode=bool(self._xyz_molecular_mode_var.get()),
+                cluster_radius=_parse_optional_radius(
+                    self._xyz_cluster_radius_var.get()
+                ),
             )
         except Exception as exc:
             messagebox.showerror("FEFF Bundle", str(exc), parent=self)
@@ -1494,9 +1865,32 @@ class EXAFSAnalysisTab(tk.Frame):
         )
         self._append_feff_log(f"  CIF: {bundle['cif_path']}")
         self._append_feff_log(f"  FEFF input: {bundle['feff_inp_path']}")
-        self._append_feff_log(
-            "  Note: XYZ -> CIF uses a boxed P1 cell because XYZ files do not contain lattice metadata."
-        )
+        if bundle.get("molecular_mode"):
+            self._append_feff_log(
+                "  Mode: molecular (real-space ATOMS card; no RECIPROCAL/KMESH)."
+            )
+        else:
+            self._append_feff_log(
+                "  Mode: periodic (boxed P1 CIF + RECIPROCAL + KMESH). "
+                "For isolated molecules, enabling Molecular mode is much faster."
+            )
+        if bundle.get("cluster_radius") is not None:
+            self._append_feff_log(
+                f"  Cluster: kept {bundle.get('atoms_used', '?')} of "
+                f"{bundle.get('atoms_total_input', '?')} atoms within "
+                f"{bundle['cluster_radius']:.1f} Å of absorber "
+                f"(dropped {bundle.get('atoms_dropped', 0)})."
+            )
+        exe = self._feff_exe_var.get().strip()
+        if exe and self._exe_is_feff8l(exe):
+            self._append_feff_log(
+                "WARNING: feff8l is EXAFS-only and cannot run this bundle "
+                "(CIF / RECIPROCAL workflow requires FEFF10)."
+            )
+            if self._xyz_spectrum_var.get().upper() == "XANES":
+                self._append_feff_log(
+                    "         XANES also requires FEFF10. Use Help → FEFF Setup / Update."
+                )
         self._load_feff_paths(silent=True)
 
     def _append_feff_log(self, text: str):
@@ -1591,6 +1985,24 @@ class EXAFSAnalysisTab(tk.Frame):
             for failure in failures[:10]:
                 self._append_feff_log(f"  - {failure}")
 
+    @staticmethod
+    def _exe_is_feff8l(exe: str) -> bool:
+        return "feff8l" in os.path.basename(str(exe)).lower()
+
+    @staticmethod
+    def _feff_inp_flags(workdir: str) -> tuple[bool, bool]:
+        """Return (is_xanes, needs_feff10) by scanning feff.inp."""
+        inp = os.path.join(workdir, "feff.inp")
+        try:
+            text = Path(inp).read_text(encoding="utf-8", errors="replace").upper()
+        except Exception:
+            return False, False
+        is_xanes = "XANES" in text
+        needs_feff10 = any(
+            kw in text for kw in ("CIF ", "\nCIF\n", "RECIPROCAL", "KMESH", "TARGET ", "EQUIVALENCE")
+        )
+        return is_xanes, needs_feff10
+
     def _resolve_feff_executable(self) -> str:
         user_path = self._feff_exe_var.get().strip()
         cfg_path = os.path.join(os.path.expanduser("~"), ".binah_config.json")
@@ -1629,6 +2041,25 @@ class EXAFSAnalysisTab(tk.Frame):
             )
             return
 
+        if self._exe_is_feff8l(exe):
+            is_xanes, needs_feff10 = self._feff_inp_flags(workdir)
+            issues = []
+            if is_xanes:
+                issues.append("• XANES keyword detected — feff8l is an EXAFS-only build")
+            if needs_feff10:
+                issues.append("• CIF / RECIPROCAL / KMESH workflow requires FEFF10")
+            if issues:
+                messagebox.showerror(
+                    "feff8l — Incompatible Input",
+                    "The selected executable (feff8l) cannot run this feff.inp:\n\n"
+                    + "\n".join(issues)
+                    + "\n\nSolutions:\n"
+                    "  • Use Help → FEFF Setup / Update to install FEFF10\n"
+                    "  • Browse to a FEFF10 'feff.exe' or 'feff.cmd' instead",
+                    parent=self,
+                )
+                return
+
         self._feff_exe_var.set(exe)
         self._run_feff_btn.config(state=tk.DISABLED)
         self._append_feff_log(f"Running FEFF: {exe}")
@@ -1643,33 +2074,34 @@ class EXAFSAnalysisTab(tk.Frame):
 
     def _run_feff_worker(self, exe: str, workdir: str):
         try:
-            command = [exe]
             lower = exe.lower()
-            if lower.endswith(".cmd") or lower.endswith(".bat"):
-                command = ["cmd", "/c", exe]
-            proc = subprocess.run(
+            command = ["cmd", "/c", exe] if lower.endswith((".cmd", ".bat")) else [exe]
+            proc = subprocess.Popen(
                 command,
                 cwd=workdir,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
                 text=True,
-                timeout=180,
-                check=False,
+                bufsize=1,
             )
-            self.after(0, lambda: self._finish_feff_run(proc.returncode, proc.stdout, proc.stderr))
+            for raw in proc.stdout:
+                line = raw.rstrip()
+                if line.startswith("[FEFF]"):
+                    status = line[6:].strip()
+                    self.after(0, lambda s=status: self._feff_status_var.set(s))
+                else:
+                    self.after(0, lambda s=line: self._append_feff_log(f"  {s}"))
+            proc.wait()
+            self.after(0, lambda rc=proc.returncode: self._finish_feff_run(rc))
         except Exception as exc:
-            self.after(0, lambda: self._finish_feff_run(-1, "", str(exc)))
+            self.after(0, lambda e=str(exc): self._finish_feff_run(-1, e))
 
-    def _finish_feff_run(self, returncode: int, stdout: str, stderr: str):
+    def _finish_feff_run(self, returncode: int, error: str = ""):
         self._run_feff_btn.config(state=tk.NORMAL)
-        self._append_feff_log(f"FEFF finished with return code {returncode}")
-        if stdout.strip():
-            self._append_feff_log("stdout:")
-            for line in stdout.strip().splitlines()[:40]:
-                self._append_feff_log(f"  {line}")
-        if stderr.strip():
-            self._append_feff_log("stderr:")
-            for line in stderr.strip().splitlines()[:40]:
-                self._append_feff_log(f"  {line}")
+        self._feff_status_var.set("")
+        if error:
+            self._append_feff_log(f"FEFF error: {error}")
+        self._append_feff_log(f"FEFF finished (return code {returncode})")
         self._load_feff_paths(silent=True)
 
     def get_params(self) -> dict:
@@ -1710,6 +2142,9 @@ class EXAFSAnalysisTab(tk.Frame):
             "xyz_spectrum": self._xyz_spectrum_var.get(),
             "xyz_kmesh": self._xyz_kmesh_var.get(),
             "xyz_equivalence": self._xyz_equiv_var.get(),
+            "xyz_xanes_emin": self._xyz_xanes_emin_var.get(),
+            "xyz_xanes_emax": self._xyz_xanes_emax_var.get(),
+            "xyz_xanes_estep": self._xyz_xanes_estep_var.get(),
         }
 
     def set_params(self, data: dict) -> None:
@@ -1774,6 +2209,9 @@ class EXAFSAnalysisTab(tk.Frame):
             self._xyz_spectrum_var.set(str(data["xyz_spectrum"]))
         _set(self._xyz_kmesh_var, "xyz_kmesh", int)
         _set(self._xyz_equiv_var, "xyz_equivalence", int)
+        _set(self._xyz_xanes_emin_var, "xyz_xanes_emin")
+        _set(self._xyz_xanes_emax_var, "xyz_xanes_emax")
+        _set(self._xyz_xanes_estep_var, "xyz_xanes_estep")
         if self._xyz_path_var.get().strip():
             self._load_xyz_structure(silent=True)
         if self._feff_dir_var.get().strip():
