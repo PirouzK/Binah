@@ -23,6 +23,7 @@ import matplotlib.ticker as mticker
 import numpy as np
 import xas_analysis_tab as xas_core
 import feff_manager
+from experimental_parser import ExperimentalScan
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
@@ -71,6 +72,62 @@ def _parse_optional_radius(value) -> float | None:
     except Exception:
         return None
     return r if r > 0 else None
+
+
+def _resolve_absorber_index(text, structure) -> tuple[int, str]:
+    """Resolve a free-form absorber spec to a 1-based atom index.
+
+    Accepts:
+      * "" / None     -> default to atom 1
+      * "5" / "  3 "  -> use as 1-based index (after bounds check)
+      * "Ni" / "ni"   -> first atom whose element symbol matches (case-
+                         insensitive). If multiple atoms match, the first one
+                         is used and `note` describes how many were found.
+
+    Returns (index_1based, note). Raises ValueError on invalid input or when
+    an element symbol has no match in the structure.
+    """
+    if structure is None:
+        raise ValueError("Load an XYZ structure first.")
+
+    raw = "" if text is None else str(text).strip()
+    n = int(structure.atom_count)
+    if not raw:
+        return 1, ""
+
+    # Numeric path: explicit atom index.
+    try:
+        idx = int(raw)
+    except ValueError:
+        idx = None
+    if idx is not None:
+        if idx < 1 or idx > n:
+            raise ValueError(
+                f"Absorber index {idx} is out of range (1..{n})."
+            )
+        sym = structure.symbols[idx - 1]
+        return idx, f"using atom #{idx} ({sym})"
+
+    # Element-symbol path. Canonicalize so e.g. "ni" -> "Ni".
+    token = raw
+    if len(token) == 1:
+        target = token.upper()
+    else:
+        target = token[0].upper() + token[1:].lower()
+
+    matches = [i + 1 for i, s in enumerate(structure.symbols) if s == target]
+    if not matches:
+        raise ValueError(
+            f"No '{target}' atom in structure (elements present: "
+            f"{', '.join(sorted(set(structure.symbols)))})."
+        )
+    chosen = matches[0]
+    if len(matches) == 1:
+        note = f"using {target} at atom #{chosen}"
+    else:
+        note = (f"using first {target} at atom #{chosen} "
+                f"(also at #{', #'.join(str(m) for m in matches[1:])})")
+    return chosen, note
 
 
 def _next_pow_two(value: int) -> int:
@@ -315,10 +372,15 @@ class EXAFSAnalysisTab(tk.Frame):
     _SCAN_COLOURS = xas_core._PALETTE
 
     def __init__(self, parent, get_scans_fn: Callable,
-                 replot_fn: Optional[Callable] = None):
+                 replot_fn: Optional[Callable] = None,
+                 add_exp_scan_fn: Optional[Callable] = None):
         super().__init__(parent)
         self._get_scans = get_scans_fn
         self._replot_fn = replot_fn
+        # Callback for handing a freshly-computed FEFF spectrum back to the
+        # main app so it appears as an experimental scan in the plot widget
+        # (and is therefore captured by project save).
+        self._add_exp_scan_fn = add_exp_scan_fn
 
         self._results: dict = {}
         self._selected_labels: list[str] = []
@@ -643,7 +705,9 @@ class EXAFSAnalysisTab(tk.Frame):
         )
         self._xyz_padding_var = tk.DoubleVar(value=6.0)
         self._xyz_cubic_var = tk.BooleanVar(value=False)
-        self._xyz_absorber_var = tk.IntVar(value=1)
+        # Accepts either a 1-based atom index ("5") or an element symbol
+        # ("Ni") that gets resolved against the loaded XYZ.
+        self._xyz_absorber_var = tk.StringVar(value="Ni")
         self._xyz_edge_var = tk.StringVar(value="K")
         self._xyz_spectrum_var = tk.StringVar(value="EXAFS")
         self._xyz_kmesh_var = tk.IntVar(value=200)
@@ -749,12 +813,13 @@ class EXAFSAnalysisTab(tk.Frame):
             font=("", 8),
         ).grid(row=1, column=4, columnspan=2, sticky="w", padx=(4, 0), pady=(4, 0))
 
-        tk.Label(xyz_box, text="Absorber #:", font=("", 8, "bold")).grid(
+        tk.Label(xyz_box, text="Absorber:", font=("", 8, "bold")).grid(
             row=2, column=0, sticky="w", pady=(4, 0)
         )
-        ttk.Entry(xyz_box, textvariable=self._xyz_absorber_var, width=8).grid(
-            row=2, column=1, sticky="w", padx=4, pady=(4, 0)
-        )
+        # Accepts an element symbol ("Ni") or a 1-based atom index ("5").
+        ttk.Entry(
+            xyz_box, textvariable=self._xyz_absorber_var, width=8,
+        ).grid(row=2, column=1, sticky="w", padx=4, pady=(4, 0))
         tk.Label(xyz_box, text="Edge:", font=("", 8, "bold")).grid(
             row=2, column=2, sticky="e", pady=(4, 0)
         )
@@ -810,6 +875,12 @@ class EXAFSAnalysisTab(tk.Frame):
             bg="#003366", fg="white", activebackground="#004C99",
             command=self._write_xyz_feff_bundle,
         ).pack(side=tk.LEFT)
+        self._batch_btn = tk.Button(
+            btn_frame, text="Batch Run...", font=("", 8, "bold"),
+            bg="#5C2A0E", fg="white", activebackground="#7A3D17",
+            command=self._on_batch_run_clicked,
+        )
+        self._batch_btn.pack(side=tk.LEFT, padx=(4, 0))
 
         tk.Label(xyz_box, text="XANES E min (eV):", font=("", 8, "bold")).grid(
             row=4, column=0, sticky="w", pady=(4, 0)
@@ -958,6 +1029,16 @@ class EXAFSAnalysisTab(tk.Frame):
             _num(self._xyz_xanes_emin_var,   "xyz_xanes_emin")
             _num(self._xyz_xanes_emax_var,   "xyz_xanes_emax")
             _num(self._xyz_xanes_estep_var,  "xyz_xanes_estep")
+            if "xyz_molecular_mode" in saved:
+                try:
+                    self._xyz_molecular_mode_var.set(bool(saved["xyz_molecular_mode"]))
+                except Exception:
+                    pass
+            if "xyz_cluster_radius" in saved:
+                try:
+                    self._xyz_cluster_radius_var.set(str(saved["xyz_cluster_radius"]))
+                except Exception:
+                    pass
 
             if self._feff_dir_var.get().strip():
                 self._load_feff_paths(silent=True)
@@ -968,32 +1049,56 @@ class EXAFSAnalysisTab(tk.Frame):
         self._setup_feff_persistence_traces()
 
     def _save_feff_tab_settings(self):
+        """Persist the EXAFS-tab state to ~/.binah_config.json.
+
+        Each variable is read defensively — a single bad/blank entry must not
+        abort the whole save (otherwise persistence silently breaks the
+        moment the user clears a numeric field).
+        """
         import json
+
+        def _safe(var):
+            try:
+                return var.get()
+            except Exception:
+                return ""
+
+        feff_tab_data = {
+            "feff_dir":         _safe(self._feff_dir_var),
+            "feff_exe":         _safe(self._feff_exe_var),
+            "xyz_path":         _safe(self._xyz_path_var),
+            "bundle_base":      _safe(self._bundle_base_var),
+            "xyz_edge":         _safe(self._xyz_edge_var),
+            "xyz_spectrum":     _safe(self._xyz_spectrum_var),
+            "xyz_padding":      _safe(self._xyz_padding_var),
+            "xyz_cubic":        _safe(self._xyz_cubic_var),
+            "xyz_absorber":     _safe(self._xyz_absorber_var),
+            "xyz_kmesh":        _safe(self._xyz_kmesh_var),
+            "xyz_equivalence":  _safe(self._xyz_equiv_var),
+            "xyz_xanes_emin":   _safe(self._xyz_xanes_emin_var),
+            "xyz_xanes_emax":   _safe(self._xyz_xanes_emax_var),
+            "xyz_xanes_estep":  _safe(self._xyz_xanes_estep_var),
+            "xyz_molecular_mode": bool(_safe(self._xyz_molecular_mode_var)),
+            "xyz_cluster_radius": str(_safe(self._xyz_cluster_radius_var)),
+        }
         try:
             cfg = {}
             if os.path.exists(self._CFG_PATH):
-                with open(self._CFG_PATH, "r", encoding="utf-8") as fh:
-                    cfg = json.load(fh)
-            cfg["feff_tab"] = {
-                "feff_dir":       self._feff_dir_var.get(),
-                "feff_exe":       self._feff_exe_var.get(),
-                "xyz_path":       self._xyz_path_var.get(),
-                "bundle_base":    self._bundle_base_var.get(),
-                "xyz_edge":       self._xyz_edge_var.get(),
-                "xyz_spectrum":   self._xyz_spectrum_var.get(),
-                "xyz_padding":    self._xyz_padding_var.get(),
-                "xyz_cubic":      self._xyz_cubic_var.get(),
-                "xyz_absorber":   self._xyz_absorber_var.get(),
-                "xyz_kmesh":      self._xyz_kmesh_var.get(),
-                "xyz_equivalence":self._xyz_equiv_var.get(),
-                "xyz_xanes_emin": self._xyz_xanes_emin_var.get(),
-                "xyz_xanes_emax": self._xyz_xanes_emax_var.get(),
-                "xyz_xanes_estep":self._xyz_xanes_estep_var.get(),
-            }
+                try:
+                    with open(self._CFG_PATH, "r", encoding="utf-8") as fh:
+                        cfg = json.load(fh)
+                except Exception:
+                    cfg = {}
+            cfg["feff_tab"] = feff_tab_data
             with open(self._CFG_PATH, "w", encoding="utf-8") as fh:
                 json.dump(cfg, fh, indent=2)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Surface failures rather than burying them — the EXAFS log is the
+            # natural channel.  Don't crash if logging itself isn't ready yet.
+            try:
+                self._append_feff_log(f"Could not save EXAFS tab settings: {exc}")
+            except Exception:
+                pass
 
     def _schedule_feff_save(self, *_):
         if hasattr(self, "_feff_save_id"):
@@ -1011,6 +1116,7 @@ class EXAFSAnalysisTab(tk.Frame):
             self._xyz_padding_var, self._xyz_cubic_var,
             self._xyz_absorber_var, self._xyz_kmesh_var, self._xyz_equiv_var,
             self._xyz_xanes_emin_var, self._xyz_xanes_emax_var, self._xyz_xanes_estep_var,
+            self._xyz_molecular_mode_var, self._xyz_cluster_radius_var,
         ):
             var.trace_add("write", self._schedule_feff_save)
 
@@ -1741,14 +1847,22 @@ class EXAFSAnalysisTab(tk.Frame):
         self._xyz_structure = structure
         if not self._bundle_base_var.get().strip():
             self._bundle_base_var.set(structure.basename)
-        absorber = self._xyz_absorber_var.get()
-        if absorber < 1 or absorber > structure.atom_count:
-            self._xyz_absorber_var.set(1)
+
+        # Resolve the absorber spec ("Ni", "5", etc.) against the loaded
+        # structure. On invalid input, fall back to atom #1 silently in this
+        # display path; the bundle-write path raises a clear error instead.
+        try:
+            resolved_idx, note = _resolve_absorber_index(
+                self._xyz_absorber_var.get(), structure
+            )
+        except Exception:
+            resolved_idx, note = 1, "default to atom #1"
+
         padding = _coerce_float(self._xyz_padding_var.get(), 6.0)
         self._xyz_info_var.set(
             f"Loaded {structure.atom_count} atoms ({structure.formula}). "
-            f"Export will write a boxed P1 CIF with {padding:.1f} A padding. "
-            "TARGET uses the 1-based XYZ atom index."
+            f"Absorber: {note}. Export uses a boxed P1 CIF with "
+            f"{padding:.1f} A padding."
         )
         if not silent:
             self._append_feff_log(
@@ -1810,6 +1924,19 @@ class EXAFSAnalysisTab(tk.Frame):
             (self._xyz_debye_temp_var.get(), self._xyz_debye_dtemp_var.get())
             if self._xyz_debye_var.get() else None
         )
+        # Resolve "Ni" / "5" / etc. against the loaded structure. Fail loud
+        # if it can't be resolved — silently defaulting would silently send
+        # the wrong absorber to FEFF and waste another long run.
+        try:
+            absorber_idx, absorber_note = _resolve_absorber_index(
+                self._xyz_absorber_var.get(), self._xyz_structure
+            )
+        except Exception as exc:
+            messagebox.showerror("Absorber", str(exc), parent=self)
+            self._append_feff_log(f"Absorber error: {exc}")
+            return
+        self._append_feff_log(f"Absorber: {absorber_note}")
+
         try:
             bundle = export_xyz_as_feff_bundle(
                 xyz_path,
@@ -1817,7 +1944,7 @@ class EXAFSAnalysisTab(tk.Frame):
                 basename=base,
                 padding=_coerce_float(self._xyz_padding_var.get(), 6.0),
                 cubic=bool(self._xyz_cubic_var.get()),
-                absorber_index=max(1, int(self._xyz_absorber_var.get())),
+                absorber_index=absorber_idx,
                 edge=self._xyz_edge_var.get(),
                 spectrum=self._xyz_spectrum_var.get(),
                 kmesh=max(1, int(self._xyz_kmesh_var.get())),
@@ -2103,6 +2230,460 @@ class EXAFSAnalysisTab(tk.Frame):
             self._append_feff_log(f"FEFF error: {error}")
         self._append_feff_log(f"FEFF finished (return code {returncode})")
         self._load_feff_paths(silent=True)
+        # Rename FEFF outputs to a descriptive name and load the spectrum
+        # into the main plot.  Best-effort: any failure here is logged but
+        # doesn't break the run.
+        if returncode == 0:
+            try:
+                self._archive_and_load_feff_outputs()
+            except Exception as exc:
+                self._append_feff_log(f"  Could not auto-load FEFF output: {exc}")
+
+    # ------------------------------------------------------------------ #
+    #  FEFF output handling                                                #
+    # ------------------------------------------------------------------ #
+    def _feff_output_label(self) -> str:
+        """Return a descriptive label like 'PK-26a_6.0A' for naming outputs."""
+        base = (self._bundle_base_var.get().strip()
+                or (self._xyz_structure.basename if self._xyz_structure else "")
+                or "feff_run")
+        radius = _parse_optional_radius(self._xyz_cluster_radius_var.get())
+        if radius is not None:
+            base = f"{base}_{radius:.1f}A"
+        return base
+
+    def _archive_and_load_feff_outputs(self,
+                                       workdir: str | None = None,
+                                       label: str | None = None,
+                                       emin: float | None = None,
+                                       emax: float | None = None,
+                                       is_xanes: bool | None = None):
+        """After a successful FEFF run:
+          * copy xmu.dat / chi.dat to <base>[_<R>A]_xmu.dat etc. in the workdir
+          * load the spectrum into Binah's plot via the main app
+
+        All arguments default to the instance state so the single-run flow
+        keeps working unchanged; the batch worker passes explicit values per
+        XYZ since the instance state is shared across the whole batch.
+        """
+        if workdir is None:
+            workdir = self._feff_dir_var.get().strip()
+        if not workdir or not os.path.isdir(workdir):
+            return
+
+        if label is None:
+            label = self._feff_output_label()
+        if emin is None:
+            emin = _coerce_float(self._xyz_xanes_emin_var.get(), -30.0)
+        if emax is None:
+            emax = _coerce_float(self._xyz_xanes_emax_var.get(), 250.0)
+        if is_xanes is None:
+            is_xanes = self._xyz_spectrum_var.get().strip().upper() == "XANES"
+
+        # Map of FEFF output -> (descriptive suffix, parser).
+        # xmu.dat is XANES/total absorption, chi.dat is EXAFS chi(k).
+        candidates = [
+            ("xmu.dat", "_xmu.dat", self._scan_from_xmu_dat),
+            ("chi.dat", "_chi.dat", self._scan_from_chi_dat),
+        ]
+
+        archived: list[Path] = []
+        loaded_scan: ExperimentalScan | None = None
+        for src_name, suffix, parser in candidates:
+            src = Path(workdir) / src_name
+            if not src.exists():
+                continue
+            dst = Path(workdir) / f"{label}{suffix}"
+            try:
+                shutil.copy2(src, dst)
+                archived.append(dst)
+            except Exception as exc:
+                self._append_feff_log(f"  Could not copy {src.name}: {exc}")
+                continue
+            # Prefer xmu.dat for the plot (it has total absorption mu(E)).
+            if loaded_scan is None:
+                try:
+                    if src_name == "xmu.dat":
+                        loaded_scan = self._scan_from_xmu_dat(
+                            dst, label,
+                            emin=emin if is_xanes else None,
+                            emax=emax if is_xanes else None,
+                        )
+                    else:
+                        loaded_scan = parser(dst, label)
+                except Exception as exc:
+                    self._append_feff_log(
+                        f"  Could not parse {dst.name} as a scan: {exc}"
+                    )
+
+        if archived:
+            self._append_feff_log("  Archived outputs:")
+            for p in archived:
+                self._append_feff_log(f"    {p.name}")
+
+        if loaded_scan is not None and self._add_exp_scan_fn is not None:
+            try:
+                self._add_exp_scan_fn(loaded_scan)
+                self._append_feff_log(
+                    f"  Loaded into plot as: {loaded_scan.label}"
+                )
+            except Exception as exc:
+                self._append_feff_log(f"  Could not push to plot: {exc}")
+
+    @staticmethod
+    def _scan_from_xmu_dat(path: Path, label: str,
+                           emin: float | None = None,
+                           emax: float | None = None) -> ExperimentalScan:
+        """Parse FEFF10's xmu.dat into an ExperimentalScan.
+
+        FEFF10 columns (after the # header block):
+            col 0: omega   absolute photon energy in eV
+            col 1: e       energy relative to threshold (E - E0) in eV
+            col 2: k       Å⁻¹
+            col 3: mu      total absorption (what we plot)
+            col 4: mu0     smooth atomic background
+            col 5: chi     k^kweight * (mu - mu0)/mu0
+
+        We plot vs absolute energy (col 0) and, when `emin`/`emax` are given
+        (the user's XANES window in relative eV), clip rows where col 1 is
+        outside that window — otherwise the plot covers the full k=0..k_max
+        range FEFF always writes (~1500 eV) and the XANES detail vanishes.
+        """
+        data = np.loadtxt(str(path), comments="#")
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        if data.shape[1] < 4:
+            raise ValueError(
+                f"xmu.dat has only {data.shape[1]} columns, expected at least 4."
+            )
+
+        omega    = np.asarray(data[:, 0], dtype=float)  # absolute energy (eV)
+        e_rel    = np.asarray(data[:, 1], dtype=float)  # relative energy (eV)
+        mu_total = np.asarray(data[:, 3], dtype=float)
+
+        # E0 = the omega where the relative energy crosses zero (threshold).
+        try:
+            zero_idx = int(np.argmin(np.abs(e_rel)))
+            e0 = float(omega[zero_idx])
+        except Exception:
+            e0 = float(omega[0])
+
+        # Clip to the user's XANES window so the rising edge isn't squished
+        # into the leftmost 1.5% of a 1500 eV plot.
+        if emin is not None and emax is not None:
+            keep = (e_rel >= float(emin)) & (e_rel <= float(emax))
+            if keep.any():
+                omega    = omega[keep]
+                e_rel    = e_rel[keep]
+                mu_total = mu_total[keep]
+
+        return ExperimentalScan(
+            label=f"FEFF: {label}",
+            source_file=str(path),
+            energy_ev=omega,
+            mu=mu_total,
+            e0=e0,
+            is_normalized=True,
+            scan_type="FEFF calculation",
+            metadata={
+                "source": "feff",
+                "filename": path.name,
+                "e0_eV": e0,
+                "n_points": int(omega.size),
+                "energy_range_eV": [float(omega[0]), float(omega[-1])],
+            },
+        )
+
+    @staticmethod
+    def _scan_from_chi_dat(path: Path, label: str) -> ExperimentalScan:
+        """Parse FEFF10's chi.dat (k, chi(k))."""
+        data = np.loadtxt(str(path), comments="#")
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+        # chi.dat columns: k[Å⁻¹], chi[k], mag, phase ...
+        k = np.asarray(data[:, 0], dtype=float)
+        chi = np.asarray(data[:, 1], dtype=float) if data.shape[1] > 1 else np.zeros_like(k)
+        return ExperimentalScan(
+            label=f"FEFF χ(k): {label}",
+            source_file=str(path),
+            energy_ev=k,
+            mu=chi,
+            e0=0.0,
+            is_normalized=True,
+            scan_type="FEFF chi(k)",
+            metadata={"source": "feff", "filename": path.name, "k_axis": True},
+        )
+
+    # ------------------------------------------------------------------ #
+    #  Batch FEFF runs                                                     #
+    # ------------------------------------------------------------------ #
+    def _on_batch_run_clicked(self):
+        """Pick N .xyz files and queue a sequential FEFF run for each."""
+        paths = filedialog.askopenfilenames(
+            title="Pick .xyz files for batch FEFF",
+            filetypes=[("XYZ files", "*.xyz"), ("All files", "*.*")],
+            parent=self,
+        )
+        if not paths:
+            return
+
+        base_workdir = self._feff_dir_var.get().strip()
+        if not base_workdir:
+            messagebox.showwarning(
+                "Batch FEFF",
+                "Pick a FEFF working directory first (Workdir at the top).",
+                parent=self,
+            )
+            return
+        exe = self._feff_exe_var.get().strip()
+        if not exe or not os.path.isfile(exe):
+            messagebox.showwarning(
+                "Batch FEFF",
+                "Pick a valid FEFF executable first (Executable at the top).",
+                parent=self,
+            )
+            return
+
+        radius = _parse_optional_radius(self._xyz_cluster_radius_var.get())
+        radius_text = f"{radius:.1f} Å" if radius is not None else "(no crop)"
+        absorber_spec = self._xyz_absorber_var.get().strip() or "1"
+
+        if not messagebox.askyesno(
+            "Batch FEFF",
+            f"Run FEFF sequentially on {len(paths)} XYZ file(s)?\n\n"
+            f"  Workdir:   {base_workdir}\n"
+            f"  Executable: {os.path.basename(exe)}\n"
+            f"  Absorber:   {absorber_spec}\n"
+            f"  Cluster:    {radius_text}\n"
+            f"  Spectrum:   {self._xyz_spectrum_var.get()}\n"
+            f"  Mol. mode:  {bool(self._xyz_molecular_mode_var.get())}\n\n"
+            "Each XYZ goes into its own subdirectory of the workdir.\n"
+            "Failed runs are logged and skipped — the batch keeps going.",
+            parent=self,
+        ):
+            return
+
+        # Snapshot every relevant setting on the main thread so the worker
+        # never reaches into Tk state (and so the user can keep editing the
+        # form without affecting in-flight runs).
+        try:
+            settings = {
+                "padding":       _coerce_float(self._xyz_padding_var.get(), 6.0),
+                "cubic":         bool(self._xyz_cubic_var.get()),
+                "absorber_spec": absorber_spec,
+                "edge":          self._xyz_edge_var.get(),
+                "spectrum":      self._xyz_spectrum_var.get(),
+                "kmesh":         max(1, int(self._xyz_kmesh_var.get())),
+                "equivalence":   max(1, min(4, int(self._xyz_equiv_var.get()))),
+                "xanes_emin":    _coerce_float(self._xyz_xanes_emin_var.get(), -30.0),
+                "xanes_emax":    _coerce_float(self._xyz_xanes_emax_var.get(), 250.0),
+                "xanes_estep":   max(0.01, _coerce_float(self._xyz_xanes_estep_var.get(), 0.25)),
+                "s02":           _coerce_float(self._xyz_s02_var.get(), 1.0),
+                "corehole":      self._xyz_corehole_var.get(),
+                "exchange":      int(self._xyz_exchange_var.get()),
+                "exchange_vr":   _coerce_float(self._xyz_exchange_vr_var.get(), 0.0),
+                "exchange_vi":   _coerce_float(self._xyz_exchange_vi_var.get(), 0.0),
+                "scf_radius":    _coerce_float(self._xyz_scf_radius_var.get(), 4.0),
+                "scf_nscf":      max(1, int(self._xyz_scf_nscf_var.get())),
+                "scf_ca":        _coerce_float(self._xyz_scf_ca_var.get(), 0.2),
+                "fms_radius":    _coerce_float(self._xyz_fms_radius_var.get(), 6.0),
+                "rpath":         _coerce_float(self._xyz_rpath_var.get(), 8.0),
+                "nleg":          int(self._xyz_nleg_var.get()),
+                "exafs_kmax":    _coerce_float(self._xyz_exafs_kmax_var.get(), 20.0),
+                "multipole_lmax":   int(self._xyz_multipole_lmax_var.get()),
+                "multipole_iorder": int(self._xyz_multipole_iorder_var.get()),
+                "molecular_mode":   bool(self._xyz_molecular_mode_var.get()),
+                "cluster_radius":   radius,
+            }
+        except Exception as exc:
+            messagebox.showerror(
+                "Batch FEFF",
+                f"Could not read XYZ-tab settings:\n{exc}\n\n"
+                "Fix any invalid numeric fields and try again.",
+                parent=self,
+            )
+            return
+
+        self._run_feff_btn.config(state=tk.DISABLED)
+        self._batch_btn.config(state=tk.DISABLED)
+        self._append_feff_log(
+            f"=== Batch FEFF: {len(paths)} XYZ file(s) queued ==="
+        )
+        threading.Thread(
+            target=self._batch_feff_worker,
+            args=(list(paths), base_workdir, exe, settings),
+            daemon=True,
+        ).start()
+
+    def _batch_feff_worker(self, xyz_paths: list[str], base_workdir: str,
+                           exe: str, settings: dict):
+        """Background thread: run FEFF on each XYZ in turn and load each
+        result into the plot.  Tk vars are NOT touched from here — UI
+        updates go through self.after()."""
+
+        def log(msg: str):
+            self.after(0, lambda m=msg: self._append_feff_log(m))
+
+        def push_scan(scan):
+            if scan is not None and self._add_exp_scan_fn is not None:
+                self.after(0, lambda s=scan: self._add_exp_scan_fn(s))
+
+        n = len(xyz_paths)
+        succeeded = 0
+        failed: list[str] = []
+
+        for idx, xyz_path in enumerate(xyz_paths, start=1):
+            xyz_name = os.path.basename(xyz_path)
+            log("")
+            log(f"--- [{idx}/{n}] {xyz_name} ---")
+
+            try:
+                # Per-XYZ subdirectory keeps outputs separated.
+                xyz_stem = re.sub(
+                    r"[^A-Za-z0-9_.-]+", "_",
+                    Path(xyz_path).stem,
+                ).strip("._") or f"xyz_{idx}"
+                sub = Path(base_workdir) / xyz_stem
+                sub.mkdir(parents=True, exist_ok=True)
+
+                # Resolve absorber against THIS XYZ (not the loaded structure
+                # in the UI) so element-symbol lookups work per-file.
+                structure = parse_xyz_file(xyz_path)
+                absorber_idx, absorber_note = _resolve_absorber_index(
+                    settings["absorber_spec"], structure
+                )
+                log(f"  Absorber: {absorber_note}")
+
+                bundle = export_xyz_as_feff_bundle(
+                    xyz_path,
+                    str(sub),
+                    basename=xyz_stem,
+                    padding=settings["padding"],
+                    cubic=settings["cubic"],
+                    absorber_index=absorber_idx,
+                    edge=settings["edge"],
+                    spectrum=settings["spectrum"],
+                    kmesh=settings["kmesh"],
+                    equivalence=settings["equivalence"],
+                    xanes_emin=settings["xanes_emin"],
+                    xanes_emax=settings["xanes_emax"],
+                    xanes_estep=settings["xanes_estep"],
+                    s02=settings["s02"],
+                    corehole=settings["corehole"],
+                    exchange=settings["exchange"],
+                    exchange_vr=settings["exchange_vr"],
+                    exchange_vi=settings["exchange_vi"],
+                    scf_radius=settings["scf_radius"],
+                    scf_nscf=settings["scf_nscf"],
+                    scf_ca=settings["scf_ca"],
+                    fms_radius=settings["fms_radius"],
+                    rpath=settings["rpath"],
+                    nleg=settings["nleg"],
+                    exafs_kmax=settings["exafs_kmax"],
+                    multipole_lmax=settings["multipole_lmax"],
+                    multipole_iorder=settings["multipole_iorder"],
+                    molecular_mode=settings["molecular_mode"],
+                    cluster_radius=settings["cluster_radius"],
+                )
+                kept = bundle.get("atoms_used", "?")
+                total = bundle.get("atoms_total_input", "?")
+                log(f"  Bundle written ({kept}/{total} atoms used)")
+
+                # Run FEFF synchronously — never spawn parallel calculations,
+                # since each FEFF run is already CPU-saturated.
+                lower = exe.lower()
+                cmd = ["cmd", "/c", exe] if lower.endswith((".cmd", ".bat")) else [exe]
+                log(f"  Running FEFF in {sub} ...")
+                proc = subprocess.run(
+                    cmd, cwd=str(sub), capture_output=True, text=True,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    log(f"  FEFF returned {proc.returncode}; skipping load.")
+                    if proc.stderr:
+                        for ln in proc.stderr.splitlines()[-5:]:
+                            log(f"    {ln}")
+                    failed.append(xyz_name)
+                    continue
+
+                log(f"  FEFF finished (rc=0)")
+
+                # Build a descriptive label like "PK-26a_6.0A".
+                radius = settings["cluster_radius"]
+                label = (f"{xyz_stem}_{radius:.1f}A"
+                         if radius is not None else xyz_stem)
+
+                # Archive and parse on the worker (pure file IO + numpy).
+                # Only the plot-add must happen on the main thread.
+                self._archive_and_load_feff_outputs_threadsafe(
+                    workdir=str(sub),
+                    label=label,
+                    settings=settings,
+                    log=log,
+                    push_scan=push_scan,
+                )
+                succeeded += 1
+            except Exception as exc:
+                log(f"  FAILED: {exc}")
+                failed.append(xyz_name)
+
+        log("")
+        log(f"=== Batch complete: {succeeded}/{n} succeeded"
+            + (f", failed: {', '.join(failed)}" if failed else "")
+            + " ===")
+        self.after(0, self._on_batch_finished)
+
+    def _archive_and_load_feff_outputs_threadsafe(self, workdir: str,
+                                                   label: str, settings: dict,
+                                                   log, push_scan):
+        """Worker-thread variant: archive xmu.dat/chi.dat under <label>_xmu.dat
+        etc., parse the spectrum, and hand it to the main thread for plotting.
+        Mirrors `_archive_and_load_feff_outputs` but is safe to call off the
+        Tk thread."""
+        is_xanes = settings["spectrum"].strip().upper() == "XANES"
+        emin = settings["xanes_emin"]
+        emax = settings["xanes_emax"]
+
+        archived = []
+        loaded_scan = None
+        for src_name, suffix in (("xmu.dat", "_xmu.dat"),
+                                 ("chi.dat", "_chi.dat")):
+            src = Path(workdir) / src_name
+            if not src.exists():
+                continue
+            dst = Path(workdir) / f"{label}{suffix}"
+            try:
+                shutil.copy2(src, dst)
+                archived.append(dst.name)
+            except Exception as exc:
+                log(f"    Could not copy {src.name}: {exc}")
+                continue
+            if loaded_scan is None:
+                try:
+                    if src_name == "xmu.dat":
+                        loaded_scan = self._scan_from_xmu_dat(
+                            dst, label,
+                            emin=emin if is_xanes else None,
+                            emax=emax if is_xanes else None,
+                        )
+                    else:
+                        loaded_scan = self._scan_from_chi_dat(dst, label)
+                except Exception as exc:
+                    log(f"    Could not parse {dst.name}: {exc}")
+
+        if archived:
+            log(f"  Archived: {', '.join(archived)}")
+        if loaded_scan is not None:
+            push_scan(loaded_scan)
+            log(f"  Pushed to plot: {loaded_scan.label}")
+
+    def _on_batch_finished(self):
+        """Re-enable the action buttons after a batch completes."""
+        try:
+            self._run_feff_btn.config(state=tk.NORMAL)
+            self._batch_btn.config(state=tk.NORMAL)
+        except Exception:
+            pass
 
     def get_params(self) -> dict:
         return {
@@ -2145,6 +2726,8 @@ class EXAFSAnalysisTab(tk.Frame):
             "xyz_xanes_emin": self._xyz_xanes_emin_var.get(),
             "xyz_xanes_emax": self._xyz_xanes_emax_var.get(),
             "xyz_xanes_estep": self._xyz_xanes_estep_var.get(),
+            "xyz_molecular_mode": bool(self._xyz_molecular_mode_var.get()),
+            "xyz_cluster_radius": str(self._xyz_cluster_radius_var.get()),
         }
 
     def set_params(self, data: dict) -> None:
@@ -2202,7 +2785,10 @@ class EXAFSAnalysisTab(tk.Frame):
         _set(self._xyz_padding_var, "xyz_padding")
         if "xyz_cubic" in data:
             self._xyz_cubic_var.set(bool(data["xyz_cubic"]))
-        _set(self._xyz_absorber_var, "xyz_absorber", int)
+        # absorber may be stored as an int (legacy) or a string ("Ni"); always
+        # round-trip as a string so element symbols are preserved.
+        if "xyz_absorber" in data:
+            self._xyz_absorber_var.set(str(data["xyz_absorber"]))
         if "xyz_edge" in data:
             self._xyz_edge_var.set(str(data["xyz_edge"]))
         if "xyz_spectrum" in data:
@@ -2212,6 +2798,10 @@ class EXAFSAnalysisTab(tk.Frame):
         _set(self._xyz_xanes_emin_var, "xyz_xanes_emin")
         _set(self._xyz_xanes_emax_var, "xyz_xanes_emax")
         _set(self._xyz_xanes_estep_var, "xyz_xanes_estep")
+        if "xyz_molecular_mode" in data:
+            self._xyz_molecular_mode_var.set(bool(data["xyz_molecular_mode"]))
+        if "xyz_cluster_radius" in data:
+            self._xyz_cluster_radius_var.set(str(data["xyz_cluster_radius"]))
         if self._xyz_path_var.get().strip():
             self._load_xyz_structure(silent=True)
         if self._feff_dir_var.get().strip():

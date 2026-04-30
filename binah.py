@@ -228,6 +228,7 @@ class OrcaTDDFTApp(tk.Tk):
             exafs_frame,
             get_scans_fn=lambda: self._plot._exp_scans,
             replot_fn=lambda: self._plot._replot(),
+            add_exp_scan_fn=self._add_exp_scan_to_plot,
         )
         self._exafs_tab.pack(fill=tk.BOTH, expand=True)
 
