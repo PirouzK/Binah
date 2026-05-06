@@ -11,6 +11,7 @@ build/
 # ── PyInstaller ───────────────────────────────────────────────────────────────
 *.spec
 !binah.spec
+!simur.spec
 
 # ── Virtual environments ──────────────────────────────────────────────────────
 venv/
@@ -21,6 +22,7 @@ env/
 # ── User project & config files (not for sharing) ────────────────────────────
 *.otproj
 .binah_config.json
+.claude/settings.local.json
 
 # ── Archives ──────────────────────────────────────────────────────────────────
 *.zip
@@ -40,3 +42,22 @@ $RECYCLE.BIN/
 
 # Local upstream checkout used to vendor sgmanalysis into this repo
 SGMPython/
+
+# Nested git repos (separate projects, not submodules)
+binah/
+
+# Build / pip caches
+.build-python/
+.pip-cache/
+.pip-tmp/
+
+# Logs and error dumps
+log.dat
+*.dat
+.feff.error
+
+# User-local settings not meant for sharing
+binah_settings.json
+
+# Claude Code internal files (settings.local.json already excluded above)
+.claude/

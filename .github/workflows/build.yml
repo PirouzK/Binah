@@ -1,11 +1,10 @@
-name: Build Executables
+name: Build Desktop Apps
 
-# Trigger: manually, or automatically on every versioned tag (e.g. v1.0.0)
 on:
-  workflow_dispatch:        # Manual run from GitHub Actions tab
+  workflow_dispatch:
   push:
     tags:
-      - 'v*.*.*'            # e.g. git tag v1.0.0 && git push --tags
+      - 'v*.*.*'
 
 jobs:
   build:
@@ -14,69 +13,61 @@ jobs:
       matrix:
         include:
           - os: windows-latest
-            artifact: Binah-Windows
-            exe_path: dist/Binah.exe
+            artifact: Binah-Simur-Windows
+            bundle: Binah-Simur-Windows.zip
 
           - os: macos-latest
-            artifact: Binah-macOS
-            exe_path: dist/Binah
-
-          - os: ubuntu-latest
-            artifact: Binah-Linux
-            exe_path: dist/Binah
+            artifact: Binah-Simur-macOS
+            bundle: Binah-Simur-macOS.zip
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
-      # ── 1. Check out source ───────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── 2. Set up Python ──────────────────────────────────────────────────
-      - name: Set up Python 3.11
+      - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.12'
 
-      # ── 3. Install tkinter system dependency ──────────────────────────────
-      # Tk ships with Python but is a system-level dependency, not a pip pkg.
-      # GitHub-hosted runners usually include it, but we ensure it explicitly.
-      - name: Install Linux system deps (tkinter, display libs)
-        if: runner.os == 'Linux'
+      - name: Verify tkinter
+        run: python -c "import tkinter; root=tkinter.Tk(); root.destroy(); print('tkinter OK')"
+
+      - name: Install Python dependencies
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y python3-tk libglib2.0-0 libsm6 libxrender1 libxext6
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
 
-      - name: Install macOS tkinter (if missing)
+      - name: Build Binah
+        run: python -m PyInstaller --noconfirm binah.spec
+
+      - name: Build Simur
+        run: python -m PyInstaller --noconfirm simur.spec
+
+      - name: Package Windows apps
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist/Binah.exe,dist/Simur.exe -DestinationPath "${{ matrix.bundle }}"
+
+      - name: Package macOS apps
         if: runner.os == 'macOS'
         run: |
-          python -c "import tkinter" 2>/dev/null || brew install python-tk@3.11 || true
+          ditto -c -k --sequesterRsrc --keepParent "dist/Binah.app" "Binah.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Simur.app" "Simur.app.zip"
+          mkdir package
+          mv Binah.app.zip Simur.app.zip package/
+          ditto -c -k package "${{ matrix.bundle }}"
 
-      - name: Verify tkinter is available
-        run: python -c "import tkinter; print('tkinter OK')"
-
-      # ── 4. Install Python dependencies ───────────────────────────────────
-      - name: Install Python deps
-        run: |
-          pip install --upgrade pip
-          pip install pyinstaller
-          pip install matplotlib numpy scipy xraylarch h5py seaborn pillow
-          pip install git+https://github.com/Beamlines-CanadianLightSource/SGMPython.git || true
-
-      # ── 5. Build with PyInstaller ─────────────────────────────────────────
-      - name: Build executable
-        run: pyinstaller binah.spec
-
-      # ── 6. Upload artifact (available for download from Actions tab) ──────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: ${{ matrix.exe_path }}
+          path: ${{ matrix.bundle }}
           retention-days: 30
 
-  # ── After all builds succeed: attach to GitHub Release ───────────────────
   release:
     name: Attach to Release
     needs: build

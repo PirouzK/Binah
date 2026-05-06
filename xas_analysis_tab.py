@@ -53,25 +53,6 @@ def _is_l_edge_e0(e0: float) -> bool:
     """Return True if E0 indicates a soft X-ray / L-edge scan (< 2000 eV)."""
     return 100 < e0 < 2000
 
-
-# ── Per-scan style defaults for the XAS Analysis plot ─────────────────────────
-_XAS_LS_OPTIONS = [
-    ("─────",  "solid"),
-    ("─ ─ ─",  "dashed"),
-    ("· · · ",  "dotted"),
-    ("─ · ─",  "dashdot"),
-]
-
-def _default_xas_scan_style(colour: str = "") -> dict:
-    return {
-        "color":      colour,   # "" → use palette auto-colour
-        "linewidth":  1.8,
-        "linestyle":  "solid",
-        "alpha":      1.0,
-        "marker":     "none",   # "none", "o", "s", "^", "D"
-        "markersize": 4,
-    }
-
 def _load_norm_defaults() -> dict:
     """Load saved norm defaults from config file; fall back to factory values."""
     try:
@@ -403,18 +384,7 @@ class XASAnalysisTab(tk.Frame):
         self._click_mode = tk.StringVar(value="")
 
         # Scan list panel — BooleanVar per label (visible in overlay)
-        self._scan_vis_vars: dict = {}    # label → tk.BooleanVar
-
-        # Per-scan style (colour, lw, ls, alpha, marker)
-        self._xas_scan_styles: dict = {}  # label → style dict
-
-        # ── Deglitch state ─────────────────────────────────────────────────────
-        # _deglitch_mode : bool — whether point-picking is active
-        # _deglitch_selected_idx : int|None — index of highlighted point in raw data
-        # _deglitch_undo : dict[label → list[(energy_ev, mu)]] — undo stack
-        self._deglitch_mode      = False
-        self._deglitch_sel_idx   = None   # index into current scan's raw arrays
-        self._deglitch_undo: dict = {}    # label → list of (energy_ev, mu) snapshots
+        self._scan_vis_vars: dict = {}   # label → tk.BooleanVar
 
         self._build_ui()
 
@@ -430,16 +400,14 @@ class XASAnalysisTab(tk.Frame):
         self._scan_cb = ttk.Combobox(top, textvariable=self._scan_var,
                                       state="readonly", width=40)
         self._scan_cb.pack(side=tk.LEFT, padx=(4, 8))
-        self._scan_cb.bind("<<ComboboxSelected>>",
-                           lambda _e: (self._clear_deglitch_selection(),
-                                       self._auto_fill_e0()))
+        self._scan_cb.bind("<<ComboboxSelected>>", lambda _e: self._auto_fill_e0())
 
         tk.Button(top, text="\u21bb Refresh Scans", font=("", 8),
                   command=self.refresh_scan_list).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
-        tk.Button(top, text="\u25b6  Run Analysis", bg="#003366", fg="white",
+        tk.Button(top, text="\u25b6  Run Analysis", bg="#003366", fg="black",
                   font=("", 9, "bold"), command=self._run).pack(side=tk.LEFT, padx=2)
 
         tk.Button(top, text="+ Add to Overlay", font=("", 8),
@@ -450,13 +418,13 @@ class XASAnalysisTab(tk.Frame):
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
         tk.Button(top, text="\u2713 Apply norm to ALL scans",
-                  bg="#1a5c1a", fg="white", font=("", 9, "bold"),
+                  bg="#1a5c1a", fg="black", font=("", 9, "bold"),
                   command=self._apply_norm_all).pack(side=tk.LEFT, padx=2)
 
         ttk.Separator(top, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=8)
 
         tk.Button(top, text="\u2211 Average Scans\u2026",
-                  bg="#5c1a5c", fg="white", font=("", 9, "bold"),
+                  bg="#5c1a5c", fg="black", font=("", 9, "bold"),
                   command=self._open_average_dialog).pack(side=tk.LEFT, padx=2)
 
         self._status_lbl = tk.Label(top, text="Load experimental scans first (File \u2192 Load Exp. Data)",
@@ -480,7 +448,7 @@ class XASAnalysisTab(tk.Frame):
         hdr = tk.Frame(outer, bg="#003366", pady=3)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="Loaded Scans", font=("", 8, "bold"),
-                 bg="#003366", fg="white").pack(side=tk.LEFT, padx=6)
+                 bg="#003366", fg="black").pack(side=tk.LEFT, padx=6)
         tk.Button(hdr, text="All", font=("", 7), pady=0, padx=3,
                   command=self._show_all_scans).pack(side=tk.RIGHT, padx=2)
         tk.Button(hdr, text="None", font=("", 7), pady=0, padx=3,
@@ -515,107 +483,6 @@ class XASAnalysisTab(tk.Frame):
                 int(-1 * (e.delta / 120)), "units")
         self._scan_list_canvas.bind("<MouseWheel>", _on_wheel)
 
-        # Visualization panel — lives below the scan list in the same column
-        self._build_viz_panel(outer)
-
-    def _build_viz_panel(self, parent):
-        """Visualization & Legend controls panel below the scan list."""
-        viz = tk.Frame(parent, bd=1, relief=tk.GROOVE)
-        viz.pack(fill=tk.X, side=tk.BOTTOM, padx=2, pady=(2, 2))
-
-        # ── Collapsible header ─────────────────────────────────────────────
-        self._viz_collapsed = False
-        viz_hdr = tk.Frame(viz, bg="#334466", pady=3)
-        viz_hdr.pack(fill=tk.X)
-
-        self._viz_toggle_lbl = tk.Label(viz_hdr, text="▼  Visualization",
-                                         font=("", 8, "bold"),
-                                         bg="#334466", fg="white")
-        self._viz_toggle_lbl.pack(side=tk.LEFT, padx=6)
-
-        self._viz_body = tk.Frame(viz, padx=4, pady=4)
-        self._viz_body.pack(fill=tk.X)
-
-        def _toggle_viz():
-            self._viz_collapsed = not self._viz_collapsed
-            if self._viz_collapsed:
-                self._viz_body.pack_forget()
-                self._viz_toggle_lbl.config(text="▶  Visualization")
-            else:
-                self._viz_body.pack(fill=tk.X)
-                self._viz_toggle_lbl.config(text="▼  Visualization")
-
-        viz_hdr.bind("<Button-1>", lambda _e: _toggle_viz())
-        self._viz_toggle_lbl.bind("<Button-1>", lambda _e: _toggle_viz())
-
-        vb = self._viz_body
-
-        def _ck(text, var, cmd=None):
-            tk.Checkbutton(vb, text=text, variable=var, font=("", 8),
-                           command=cmd or self._redraw_xanes,
-                           anchor="w").pack(fill=tk.X, pady=1)
-
-        def _sec(text):
-            tk.Label(vb, text=text, font=("", 8, "bold"), fg="#334466",
-                     anchor="w").pack(fill=tk.X, pady=(5, 1))
-
-        # ── Show / Hide curves ────────────────────────────────────────────
-        _sec("── Show on XANES ──────────")
-        _ck("μ(E)  raw",          self._show_raw_var)
-        _ck("Pre-edge fit",        self._show_preline_var)
-        _ck("Post-edge fit",       self._show_postline_var)
-        _ck("Background (bkg)",    self._show_bkg_var)
-        _ck("Normalized μ(E)",     self._show_norm_var)
-        _ck("Derivative dμ/dE",    self._show_deriv_var)
-
-        _sec("── Show on EXAFS ──────────")
-        _ck("FT window on χ(k)",   self._show_win_var,
-            cmd=self._redraw_exafs)
-
-        # ── Legend ────────────────────────────────────────────────────────
-        _sec("── Legend ───────────────────")
-        _ck("Show legend",          self._show_legend_var)
-
-        loc_fr = tk.Frame(vb); loc_fr.pack(fill=tk.X, pady=1)
-        tk.Label(loc_fr, text="Location:", font=("", 8), width=10,
-                 anchor="w").pack(side=tk.LEFT)
-        ttk.Combobox(loc_fr, textvariable=self._legend_loc_var,
-                     state="readonly", width=12, font=("", 8),
-                     values=["best", "upper right", "upper left",
-                              "lower right", "lower left",
-                              "center right", "center left",
-                              "upper center", "lower center", "center"]
-                     ).pack(side=tk.LEFT)
-        self._legend_loc_var.trace_add("write", lambda *_: self._redraw_xanes())
-
-        sz_fr = tk.Frame(vb); sz_fr.pack(fill=tk.X, pady=1)
-        tk.Label(sz_fr, text="Font size:", font=("", 8), width=10,
-                 anchor="w").pack(side=tk.LEFT)
-        ttk.Spinbox(sz_fr, textvariable=self._legend_size_var,
-                    from_=6, to=18, width=4, font=("", 8),
-                    command=self._redraw_xanes).pack(side=tk.LEFT)
-        self._legend_size_var.trace_add("write", lambda *_: self._redraw_xanes())
-
-        # ── Seaborn theme ──────────────────────────────────────────────────
-        _sec("── Plot Theme ──────────────")
-        sty_fr = tk.Frame(vb); sty_fr.pack(fill=tk.X, pady=1)
-        tk.Label(sty_fr, text="Style:", font=("", 8), width=10,
-                 anchor="w").pack(side=tk.LEFT)
-        ttk.Combobox(sty_fr, textvariable=self._style_var, width=10,
-                     state="readonly",
-                     values=["ticks", "whitegrid", "darkgrid", "white", "dark"]
-                     ).pack(side=tk.LEFT)
-        self._style_var.trace_add("write", lambda *_: self._redraw_xanes())
-
-        ctx_fr = tk.Frame(vb); ctx_fr.pack(fill=tk.X, pady=1)
-        tk.Label(ctx_fr, text="Context:", font=("", 8), width=10,
-                 anchor="w").pack(side=tk.LEFT)
-        ttk.Combobox(ctx_fr, textvariable=self._context_var, width=10,
-                     state="readonly",
-                     values=["paper", "notebook", "talk", "poster"]
-                     ).pack(side=tk.LEFT)
-        self._context_var.trace_add("write", lambda *_: self._redraw_xanes())
-
     def _rebuild_scan_list_rows(self):
         """Destroy and recreate all rows in the scan list panel."""
         for w in self._scan_list_inner.winfo_children():
@@ -630,22 +497,11 @@ class XASAnalysisTab(tk.Frame):
                 self._scan_vis_vars[label] = tk.BooleanVar(value=True)
             var = self._scan_vis_vars[label]
 
-            # Ensure style dict exists for this scan
-            if label not in self._xas_scan_styles:
-                self._xas_scan_styles[label] = _default_xas_scan_style(col)
-
-            style = self._xas_scan_styles[label]
-            swatch_col = style.get("color") or col
-
             row = tk.Frame(self._scan_list_inner, bg="white")
             row.pack(fill=tk.X, pady=1, padx=2)
 
-            # Colour swatch (clickable → opens style dialog)
-            swatch = tk.Label(row, bg=swatch_col, width=2, relief=tk.RAISED,
-                              cursor="hand2")
-            swatch.pack(side=tk.LEFT, padx=(2, 2))
-            swatch.bind("<Button-1>",
-                        lambda _e, lbl=label: self._open_xas_scan_style_dialog(lbl))
+            # Colour swatch
+            tk.Label(row, bg=col, width=2, relief=tk.FLAT).pack(side=tk.LEFT, padx=(2, 3))
 
             # Visibility checkbox
             cb = tk.Checkbutton(row, variable=var, bg="white", pady=0,
@@ -653,7 +509,7 @@ class XASAnalysisTab(tk.Frame):
             cb.pack(side=tk.LEFT)
 
             # Clickable label — selects scan + runs analysis
-            short = label if len(label) <= 18 else label[:17] + "…"
+            short = label if len(label) <= 22 else label[:20] + "…"
             lbl_w = tk.Label(row, text=short, anchor="w", bg="white",
                              font=("", 8), cursor="hand2", fg="#003366")
             lbl_w.pack(side=tk.LEFT, fill=tk.X, expand=True)
@@ -661,147 +517,9 @@ class XASAnalysisTab(tk.Frame):
             lbl_w.bind("<Enter>", lambda _e, w=lbl_w: w.config(fg="#0066CC", font=("", 8, "underline")))
             lbl_w.bind("<Leave>", lambda _e, w=lbl_w: w.config(fg="#003366", font=("", 8)))
 
-            # 🎨 style button
-            tk.Button(row, text="🎨", font=("", 7), pady=0, padx=1,
-                      relief=tk.FLAT, bg="white", cursor="hand2",
-                      command=lambda lbl=label: self._open_xas_scan_style_dialog(lbl)
-                      ).pack(side=tk.RIGHT, padx=(0, 2))
-
         if not scans:
             tk.Label(self._scan_list_inner, text="No scans loaded",
                      fg="gray", font=("", 8, "italic"), bg="white").pack(pady=10)
-
-    def _open_xas_scan_style_dialog(self, label: str):
-        """Per-scan style editor — colour, line width/style, alpha, marker."""
-        scans  = self._get_scans()
-        idx    = next((i for i, (lbl, *_) in enumerate(scans) if lbl == label), 0)
-        auto_col = _PALETTE[idx % len(_PALETTE)]
-
-        if label not in self._xas_scan_styles:
-            self._xas_scan_styles[label] = _default_xas_scan_style(auto_col)
-        style = self._xas_scan_styles[label]
-
-        win = tk.Toplevel(self)
-        win.title("Scan Style")
-        win.resizable(False, False)
-        win.grab_set()
-        win.lift()
-
-        hdr = tk.Frame(win, bg="#003366", padx=10, pady=6)
-        hdr.pack(fill=tk.X)
-        tk.Label(hdr, text="XAS Scan Style", bg="#003366", fg="white",
-                 font=("", 10, "bold")).pack(anchor="w")
-        tk.Label(hdr, text=label[:60] + ("…" if len(label) > 60 else ""),
-                 bg="#003366", fg="#aaaaff", font=("", 8)).pack(anchor="w")
-
-        body = tk.Frame(win, padx=14, pady=10)
-        body.pack(fill=tk.BOTH)
-
-        def _row_lbl(text, r):
-            tk.Label(body, text=text, font=("", 9, "bold"), anchor="w").grid(
-                row=r, column=0, sticky="w", pady=(6, 2))
-
-        # ── Colour ───────────────────────────────────────────────────────────
-        _row_lbl("Color:", 0)
-        col_var = tk.StringVar(value=style.get("color") or auto_col)
-        col_swatch = tk.Button(body, bg=col_var.get(), width=5, relief=tk.RAISED,
-                               cursor="hand2")
-        col_swatch.grid(row=0, column=1, sticky="w", padx=4)
-
-        def _pick_col():
-            from tkinter import colorchooser
-            r = colorchooser.askcolor(color=col_var.get(), parent=win,
-                                      title="Choose scan colour")
-            if r and r[1]:
-                col_var.set(r[1])
-                col_swatch.config(bg=r[1], activebackground=r[1])
-        col_swatch.config(command=_pick_col)
-
-        tk.Button(body, text="Auto", font=("", 8),
-                  command=lambda: (col_var.set(auto_col),
-                                   col_swatch.config(bg=auto_col))
-                  ).grid(row=0, column=2, sticky="w")
-
-        # ── Line style ────────────────────────────────────────────────────────
-        _row_lbl("Line style:", 1)
-        ls_var = tk.StringVar(value=style.get("linestyle", "solid"))
-        ls_fr = tk.Frame(body)
-        ls_fr.grid(row=1, column=1, columnspan=3, sticky="w")
-        for disp, val in _XAS_LS_OPTIONS:
-            tk.Radiobutton(ls_fr, text=disp, variable=ls_var,
-                           value=val, font=("Courier", 9)).pack(side=tk.LEFT, padx=4)
-
-        # ── Line width ────────────────────────────────────────────────────────
-        _row_lbl("Line width:", 2)
-        lw_var = tk.DoubleVar(value=style.get("linewidth", 1.8))
-        lw_fr = tk.Frame(body); lw_fr.grid(row=2, column=1, columnspan=3, sticky="w")
-        tk.Scale(lw_fr, variable=lw_var, from_=0.5, to=5.0, resolution=0.1,
-                 orient=tk.HORIZONTAL, length=160, showvalue=True,
-                 font=("", 8)).pack(side=tk.LEFT)
-
-        # ── Opacity ──────────────────────────────────────────────────────────
-        _row_lbl("Opacity:", 3)
-        alpha_var = tk.DoubleVar(value=style.get("alpha", 1.0))
-        al_fr = tk.Frame(body); al_fr.grid(row=3, column=1, columnspan=3, sticky="w")
-        tk.Scale(al_fr, variable=alpha_var, from_=0.1, to=1.0, resolution=0.05,
-                 orient=tk.HORIZONTAL, length=160, showvalue=True,
-                 font=("", 8)).pack(side=tk.LEFT)
-
-        # ── Marker ───────────────────────────────────────────────────────────
-        _row_lbl("Marker:", 4)
-        marker_var = tk.StringVar(value=style.get("marker", "none"))
-        ms_var     = tk.IntVar(value=style.get("markersize", 4))
-        mk_fr = tk.Frame(body); mk_fr.grid(row=4, column=1, columnspan=3, sticky="w")
-        for disp, val in [("None", "none"), ("●", "o"), ("■", "s"),
-                           ("▲", "^"), ("◆", "D")]:
-            tk.Radiobutton(mk_fr, text=disp, variable=marker_var,
-                           value=val, font=("", 10)).pack(side=tk.LEFT, padx=3)
-        tk.Label(mk_fr, text="  size:", font=("", 8)).pack(side=tk.LEFT)
-        ttk.Spinbox(mk_fr, textvariable=ms_var, from_=2, to=12, width=3,
-                    font=("", 8)).pack(side=tk.LEFT, padx=2)
-
-        ttk.Separator(body, orient=tk.HORIZONTAL).grid(
-            row=5, column=0, columnspan=4, sticky="ew", pady=8)
-
-        # ── Buttons ──────────────────────────────────────────────────────────
-        def _read():
-            return {
-                "color":      col_var.get(),
-                "linewidth":  lw_var.get(),
-                "linestyle":  ls_var.get(),
-                "alpha":      alpha_var.get(),
-                "marker":     marker_var.get(),
-                "markersize": ms_var.get(),
-            }
-
-        def _apply():
-            style.update(_read())
-            self._rebuild_scan_list_rows()
-            self._redraw_xanes()
-            win.destroy()
-
-        def _apply_all():
-            """Apply lw/ls/alpha/marker to all scans but keep individual colours."""
-            vals = _read()
-            for lbl in list(self._xas_scan_styles):
-                st = self._xas_scan_styles[lbl]
-                st["linewidth"]  = vals["linewidth"]
-                st["linestyle"]  = vals["linestyle"]
-                st["alpha"]      = vals["alpha"]
-                st["marker"]     = vals["marker"]
-                st["markersize"] = vals["markersize"]
-            self._rebuild_scan_list_rows()
-            self._redraw_xanes()
-            win.destroy()
-
-        btn_fr = tk.Frame(body)
-        btn_fr.grid(row=6, column=0, columnspan=4, pady=(0, 4))
-        tk.Button(btn_fr, text="Apply", bg="#003366", fg="white",
-                  font=("", 9, "bold"), command=_apply).pack(side=tk.LEFT, padx=4)
-        tk.Button(btn_fr, text="Apply to All Scans", font=("", 8),
-                  command=_apply_all).pack(side=tk.LEFT, padx=4)
-        tk.Button(btn_fr, text="Cancel",
-                  command=win.destroy).pack(side=tk.LEFT, padx=4)
 
     def _select_scan(self, label: str):
         """Click on a scan name — select it in combobox, auto-fill E0, run analysis."""
@@ -894,7 +612,7 @@ class XASAnalysisTab(tk.Frame):
 
         # "Set as Default" — saves current norm ranges to config file
         tk.Button(pf, text="\u2605 Set Norm as Default", font=("", 8, "bold"),
-                  bg="#003366", fg="white", activebackground="#0055aa",
+                  bg="#003366", fg="black", activebackground="#0055aa",
                   command=self._set_norm_default).pack(fill=tk.X, pady=(4, 2))
 
         # ── AUTOBK ── K-edge only ─────────────────────────────────────────
@@ -924,13 +642,35 @@ class XASAnalysisTab(tk.Frame):
             tk.Radiobutton(f_kw, text=str(v), variable=self._kw_var,
                            value=v, font=("", 8)).pack(side=tk.LEFT)
 
-        # Plot style + legend vars — widgets now live in _build_viz_panel
-        self._style_var   = tk.StringVar(value="ticks")
+        # ── Plot style ────────────────────────────────────────────────────
+        lbl("\u2500\u2500 Plot Style \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
+        self._style_var = tk.StringVar(value="ticks")
         self._context_var = tk.StringVar(value="paper")
+        f_sty = tk.Frame(pf); f_sty.pack(fill=tk.X, pady=1)
+        tk.Label(f_sty, text="Style:", width=14, anchor="w",
+                 font=("", 8)).pack(side=tk.LEFT)
+        ttk.Combobox(f_sty, textvariable=self._style_var, width=10,
+                     state="readonly",
+                     values=["ticks", "whitegrid", "darkgrid", "white", "dark"]
+                     ).pack(side=tk.LEFT)
+        f_ctx = tk.Frame(pf); f_ctx.pack(fill=tk.X, pady=1)
+        tk.Label(f_ctx, text="Context:", width=14, anchor="w",
+                 font=("", 8)).pack(side=tk.LEFT)
+        ttk.Combobox(f_ctx, textvariable=self._context_var, width=10,
+                     state="readonly",
+                     values=["paper", "notebook", "talk", "poster"]
+                     ).pack(side=tk.LEFT)
 
-        # ── Show on XANES plot — vars initialised here, widgets built in
-        #    _build_viz_panel() which sits in the scan-list column ────────────
-        self._show_section_frame = tk.Frame(pf)   # kept for _update_show_section_visibility
+        # ── Show on XANES plot (Athena-style) — hidden when >1 scan shown ────
+        self._show_section_frame = tk.Frame(pf)
+        self._show_section_frame.pack(fill=tk.X)
+
+        def _slbl(text):
+            tk.Label(self._show_section_frame, text=text,
+                     font=("", 8, "bold"), fg="#333333",
+                     anchor="w").pack(fill=tk.X, pady=(6, 0))
+
+        _slbl("── Show on XANES plot ───────")
         self._show_raw_var      = tk.BooleanVar(value=True)
         self._show_preline_var  = tk.BooleanVar(value=True)
         self._show_postline_var = tk.BooleanVar(value=True)
@@ -938,10 +678,18 @@ class XASAnalysisTab(tk.Frame):
         self._show_norm_var     = tk.BooleanVar(value=True)
         self._show_deriv_var    = tk.BooleanVar(value=False)
         self._show_win_var      = tk.BooleanVar(value=True)
-        # Legend state vars
-        self._show_legend_var   = tk.BooleanVar(value=True)
-        self._legend_loc_var    = tk.StringVar(value="best")
-        self._legend_size_var   = tk.IntVar(value=8)
+
+        for _txt, _var in [
+            ("\u03bc(E)  raw",         self._show_raw_var),
+            ("Pre-edge fit",           self._show_preline_var),
+            ("Post-edge fit",          self._show_postline_var),
+            ("Background (bkg)",       self._show_bkg_var),
+            ("Normalized \u03bc(E)",   self._show_norm_var),
+            ("Derivative d\u03bc/dE",  self._show_deriv_var),
+        ]:
+            tk.Checkbutton(self._show_section_frame, text=_txt, variable=_var,
+                           command=self._redraw_xanes,
+                           font=("", 8)).pack(anchor="w", pady=1)
 
         lbl("\u2500\u2500 View Box \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
         self._xanes_xmin_var = tk.StringVar(value="")
@@ -1287,7 +1035,6 @@ class XASAnalysisTab(tk.Frame):
         self._status_lbl.config(
             text=f"Reset {label} to the originally loaded scan.",
             fg="gray")
-
     # ── Averaging dialog ─────────────────────────────────────────────────────
 
     def _open_average_dialog(self):
@@ -1307,7 +1054,7 @@ class XASAnalysisTab(tk.Frame):
         hdr = tk.Frame(dlg, bg="#5c1a5c", padx=10, pady=6)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="\u2211  Average XAS Scans", font=("", 11, "bold"),
-                 bg="#5c1a5c", fg="white").pack(side=tk.LEFT)
+                 bg="#5c1a5c", fg="black").pack(side=tk.LEFT)
 
         body = tk.Frame(dlg, padx=12, pady=8)
         body.pack(fill=tk.BOTH, expand=True)
@@ -1444,7 +1191,7 @@ class XASAnalysisTab(tk.Frame):
                     fg="#885500")
 
         tk.Button(btn_fr, text="\u2211  Average & Add to Binah",
-                  bg="#5c1a5c", fg="white", font=("", 9, "bold"),
+                  bg="#5c1a5c", fg="black", font=("", 9, "bold"),
                   command=_do_average).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_fr, text="Cancel",
                   command=dlg.destroy).pack(side=tk.LEFT, padx=4)
@@ -1627,26 +1374,6 @@ class XASAnalysisTab(tk.Frame):
         tk.Button(bar, text="\u2715 Cancel", font=("", 8), bg="#ECECEC",
                   command=lambda: self._set_click_mode("")).pack(side=tk.LEFT, padx=6)
 
-        # ── Deglitch controls (right side of toolbar) ─────────────────────────
-        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y,
-                                                     padx=8, pady=2)
-        self._deglitch_btn = tk.Button(
-            bar, text="\U0001f9f9 Deglitch", font=("", 8), bg="#ECECEC",
-            command=self._toggle_deglitch_mode)
-        self._deglitch_btn.pack(side=tk.LEFT, padx=2)
-
-        self._deglitch_remove_btn = tk.Button(
-            bar, text="Remove Point", font=("", 8, "bold"),
-            bg="#CC0000", fg="white", state=tk.DISABLED,
-            command=self._deglitch_remove_selected)
-        self._deglitch_remove_btn.pack(side=tk.LEFT, padx=2)
-
-        self._deglitch_undo_btn = tk.Button(
-            bar, text="Undo", font=("", 8),
-            bg="#885500", fg="white", state=tk.DISABLED,
-            command=self._deglitch_undo_last)
-        self._deglitch_undo_btn.pack(side=tk.LEFT, padx=2)
-
         self._click_hint = tk.Label(
             bar, text="  Select a parameter above, then click on the plot",
             fg="gray", font=("", 8, "italic"), bg="#ECECEC")
@@ -1662,7 +1389,7 @@ class XASAnalysisTab(tk.Frame):
                             bg="#FFB347", fg="black")
             else:
                 _btn.config(relief=tk.RAISED, font=("", 8),
-                            bg=_inactive[_key], fg="white")
+                            bg=_inactive[_key], fg="black")
         if mode:
             self._click_hint.config(
                 text=f"  \u2192 Click on plot to set  {mode}  (\u2715 to cancel)",
@@ -1673,20 +1400,12 @@ class XASAnalysisTab(tk.Frame):
                 fg="gray")
 
     def _on_plot_click(self, event):
-        if event.button != 1:
+        mode = self._click_mode.get()
+        if not mode or event.button != 1:
             return
         if getattr(self._toolbar_xanes, 'mode', ''):
             return
         if event.inaxes is None or event.xdata is None:
-            return
-
-        # ── Deglitch mode: pick nearest raw data point ────────────────────────
-        if self._deglitch_mode:
-            self._deglitch_pick_point(event)
-            return
-
-        mode = self._click_mode.get()
-        if not mode:
             return
 
         x  = event.xdata
@@ -1706,136 +1425,6 @@ class XASAnalysisTab(tk.Frame):
         self._set_click_mode("")
         if self._scan_var.get():
             self._run()
-
-    # ── Deglitch ─────────────────────────────────────────────────────────────
-
-    def _clear_deglitch_selection(self):
-        """Drop any highlighted point (e.g. when scan changes)."""
-        self._deglitch_sel_idx = None
-        if hasattr(self, '_deglitch_remove_btn'):
-            self._deglitch_remove_btn.config(state=tk.DISABLED)
-
-    def _toggle_deglitch_mode(self):
-        """Enter / exit point-picking deglitch mode."""
-        self._deglitch_mode = not self._deglitch_mode
-        self._deglitch_sel_idx = None
-
-        if self._deglitch_mode:
-            # Cancel any parameter-set click mode
-            self._set_click_mode("")
-            # Ensure raw data is visible so points can be seen
-            if hasattr(self, '_show_raw_var'):
-                self._show_raw_var.set(True)
-            self._deglitch_btn.config(relief=tk.SUNKEN, bg="#FFB347", fg="black",
-                                       font=("", 8, "bold"))
-            self._click_hint.config(
-                text="  Deglitch: click a data point to select it, then click Remove Point",
-                fg="#994400")
-        else:
-            self._deglitch_btn.config(relief=tk.RAISED, bg="#ECECEC", fg="black",
-                                       font=("", 8))
-            self._deglitch_remove_btn.config(state=tk.DISABLED)
-            self._click_hint.config(
-                text="  Select a parameter above, then click on the plot",
-                fg="gray")
-        self._redraw_xanes()
-
-    def _deglitch_pick_point(self, event):
-        """Find and highlight the raw data point nearest to the click."""
-        label = self._scan_var.get()
-        scan  = self._get_scan_by_label(label)
-        if scan is None:
-            return
-
-        # Work on the raw energy/mu stored in the scan object
-        energy = scan.energy_ev
-        mu     = scan.mu
-        if len(energy) == 0:
-            return
-
-        # Convert data coords to display pixels for both axes, find nearest point
-        ax    = self._ax_mu
-        xy_px = ax.transData.transform(np.column_stack([energy, mu]))
-        click_px = ax.transData.transform([[event.xdata, event.ydata]])[0]
-        dists = np.hypot(xy_px[:, 0] - click_px[0], xy_px[:, 1] - click_px[1])
-        nearest = int(np.argmin(dists))
-
-        # Only select if within 15 px (avoids accidental picks)
-        if dists[nearest] > 15:
-            self._deglitch_sel_idx = None
-            self._deglitch_remove_btn.config(state=tk.DISABLED)
-            self._click_hint.config(
-                text="  Click closer to a data point to select it", fg="#994400")
-        else:
-            self._deglitch_sel_idx = nearest
-            self._deglitch_remove_btn.config(state=tk.NORMAL)
-            self._click_hint.config(
-                text=f"  Selected point {nearest}: E = {energy[nearest]:.2f} eV,"
-                     f"  μ = {mu[nearest]:.4f}   →  click Remove Point to delete",
-                fg="#CC0000")
-        self._redraw_xanes()
-
-    def _deglitch_remove_selected(self):
-        """Delete the selected data point from the scan's raw arrays and re-run."""
-        label = self._scan_var.get()
-        scan  = self._get_scan_by_label(label)
-        idx   = self._deglitch_sel_idx
-        if scan is None or idx is None:
-            return
-
-        # Save undo snapshot before modifying
-        if label not in self._deglitch_undo:
-            self._deglitch_undo[label] = []
-        self._deglitch_undo[label].append(
-            (scan.energy_ev.copy(), scan.mu.copy()))
-        self._deglitch_undo_btn.config(state=tk.NORMAL)
-
-        # Delete the point
-        scan.energy_ev = np.delete(scan.energy_ev, idx)
-        scan.mu        = np.delete(scan.mu,        idx)
-
-        # Also delete from reference if present and same length
-        if (scan.ref_energy_ev is not None
-                and len(scan.ref_energy_ev) == len(scan.energy_ev) + 1):
-            scan.ref_energy_ev = np.delete(scan.ref_energy_ev, idx)
-        if (scan.ref_mu is not None
-                and len(scan.ref_mu) == len(scan.mu) + 1):
-            scan.ref_mu = np.delete(scan.ref_mu, idx)
-
-        # Invalidate cached result so _run reprocesses
-        self._results.pop(label, None)
-        self._deglitch_sel_idx = None
-        self._deglitch_remove_btn.config(state=tk.DISABLED)
-        n_removed = len(self._deglitch_undo[label])
-        self._click_hint.config(
-            text=f"  Point removed ({n_removed} removed total). Click another to continue.",
-            fg="#005500")
-
-        # Re-run analysis with updated data
-        self._run()
-
-    def _deglitch_undo_last(self):
-        """Restore the last removed point."""
-        label = self._scan_var.get()
-        scan  = self._get_scan_by_label(label)
-        if scan is None or not self._deglitch_undo.get(label):
-            return
-
-        energy_bak, mu_bak = self._deglitch_undo[label].pop()
-        scan.energy_ev = energy_bak
-        scan.mu        = mu_bak
-        self._results.pop(label, None)
-        self._deglitch_sel_idx = None
-        self._deglitch_remove_btn.config(state=tk.DISABLED)
-
-        if not self._deglitch_undo[label]:
-            self._deglitch_undo_btn.config(state=tk.DISABLED)
-
-        remaining = len(self._deglitch_undo.get(label, []))
-        self._click_hint.config(
-            text=f"  Undo: point restored  ({remaining} removal(s) remaining in history)",
-            fg="#005500")
-        self._run()
 
     # ── Empty-state figures ───────────────────────────────────────────────────
 
@@ -2305,19 +1894,7 @@ class XASAnalysisTab(tk.Frame):
             res = self._results.get(label)
             if res is None:
                 continue
-
-            # ── Per-scan style ─────────────────────────────────────────────
-            auto_col = _PALETTE[i % len(_PALETTE)]
-            sty      = self._xas_scan_styles.get(label,
-                           _default_xas_scan_style(auto_col))
-            col      = sty.get("color") or auto_col
-            lw       = sty.get("linewidth", 1.8)
-            ls       = sty.get("linestyle", "solid")
-            alpha    = sty.get("alpha", 1.0)
-            mk       = sty.get("marker", "none")
-            mks      = sty.get("markersize", 4)
-            mk_kw    = {} if mk == "none" else {"marker": mk, "markersize": mks}
-
+            col   = _PALETTE[i % len(_PALETTE)]
             lbl_s = label[:30] + ("\u2026" if len(label) > 30 else "")
 
             energy    = res["energy"]
@@ -2328,25 +1905,9 @@ class XASAnalysisTab(tk.Frame):
             edge_step = res.get("edge_step", 1.0)
             bkg_e     = res.get("bkg_e")
 
-            # ── Deglitch overlay: show individual raw points for selected scan ─
-            is_active_scan = (label == self._scan_var.get())
-            if self._deglitch_mode and is_active_scan and mu_raw is not None:
-                ax.scatter(energy, mu_raw, s=18, color=col, alpha=0.7,
-                           zorder=6, linewidths=0.8,
-                           facecolors="none", edgecolors=col,
-                           label=f"data points  {lbl_s}" if i == 0 else "_nolegend_")
-                si = self._deglitch_sel_idx
-                if si is not None and 0 <= si < len(energy):
-                    ax.scatter(energy[si], mu_raw[si], s=120, color="#CC0000",
-                               zorder=8, linewidths=1.5,
-                               marker="o", edgecolors="#660000",
-                               label=f"selected (E={energy[si]:.2f} eV)" if i == 0
-                                     else "_nolegend_")
-
             # ── Raw μ(E) ───────────────────────────────────────────────────
             if self._show_raw_var.get() and mu_raw is not None:
-                lw_raw = 0.7 if (self._deglitch_mode and is_active_scan) else lw * 0.65
-                ax.plot(energy, mu_raw, color=col, lw=lw_raw, alpha=alpha * 0.45,
+                ax.plot(energy, mu_raw, color=col, lw=1.2, alpha=0.50,
                         ls="--",
                         label=f"\u03bc(E) raw  {lbl_s}" if i == 0 else "_nolegend_")
 
@@ -2356,30 +1917,30 @@ class XASAnalysisTab(tk.Frame):
                         ls=":", alpha=0.80, zorder=2,
                         label="Pre-edge fit" if i == 0 else "_nolegend_")
 
-            # ── Post-edge reference ────────────────────────────────────────
+            # ── Post-edge reference (constant at edge_step above pre-edge) ─
             if self._show_postline_var.get() and pre_line is not None:
                 ax.plot(energy, pre_line + edge_step, color="#1A9641", lw=1.0,
                         ls=":", alpha=0.80, zorder=2,
                         label="Post-edge ref" if i == 0 else "_nolegend_")
 
-            # ── Normalized μ(E) — uses full per-scan style ─────────────────
+            # ── Normalized μ(E) ────────────────────────────────────────────
             if self._show_norm_var.get():
-                ax.plot(energy, mu_norm, color=col, lw=lw, ls=ls, alpha=alpha,
-                        zorder=4, label=lbl_s, **mk_kw)
+                ax.plot(energy, mu_norm, color=col, lw=1.8,
+                        label=lbl_s, zorder=4)
 
             # ── Background ────────────────────────────────────────────────
             if self._show_bkg_var.get() and bkg_e is not None:
                 _mask = energy >= e0
-                ax.plot(energy[_mask], bkg_e[_mask], color=col, lw=max(lw * 0.6, 0.8),
-                        ls="--", alpha=alpha * 0.60, zorder=3,
+                ax.plot(energy[_mask], bkg_e[_mask], color=col, lw=1.0,
+                        ls="--", alpha=0.60, zorder=3,
                         label="bkg" if i == 0 else "_nolegend_")
 
             # ── Derivative ────────────────────────────────────────────────
             if self._show_deriv_var.get():
                 _deriv = np.gradient(mu_norm, energy)
                 _amp   = (np.max(mu_norm) - np.min(mu_norm)) / (np.max(np.abs(_deriv)) + 1e-10)
-                ax.plot(energy, _deriv * _amp, color=col, lw=max(lw * 0.6, 0.8),
-                        ls="-.", alpha=alpha * 0.75,
+                ax.plot(energy, _deriv * _amp, color=col, lw=1.0,
+                        ls="-.", alpha=0.65,
                         label="d\u03bc/dE (scaled)" if i == 0 else "_nolegend_")
 
             # ── Normalization region markers (first scan only) ─────────────
@@ -2421,10 +1982,7 @@ class XASAnalysisTab(tk.Frame):
         self._apply_xanes_view_limits()
 
         if self._selected_labels:
-            if self._show_legend_var.get():
-                ax.legend(fontsize=self._legend_size_var.get(),
-                          loc=self._legend_loc_var.get(),
-                          framealpha=0.85, edgecolor="#cccccc")
+            ax.legend(fontsize=7, loc="lower right", framealpha=0.8)
         else:
             ax.text(0.5, 0.45, "Load a scan and click  \u25b6  Run Analysis",
                     transform=ax.transAxes,

@@ -1337,7 +1337,7 @@ class PlotWidget(tk.Frame):
         btn = tk.Frame(win)
         btn.pack(pady=(0, 10))
         tk.Button(btn, text="Apply",          width=12, command=apply).pack(side=tk.LEFT, padx=4)
-        tk.Button(btn, text="Set as Default", width=14, bg="#003366", fg="white",
+        tk.Button(btn, text="Set as Default", width=14, bg="#003366", fg="black",
                   command=set_as_default).pack(side=tk.LEFT, padx=4)
         tk.Button(btn, text="Factory Reset",  width=12, command=reset).pack(side=tk.LEFT, padx=4)
         tk.Button(btn, text="Cancel",         width=10, command=win.destroy).pack(side=tk.LEFT, padx=4)
@@ -1389,7 +1389,7 @@ class PlotWidget(tk.Frame):
         hdr = tk.Frame(win, bg="#6B0000", padx=10, pady=6)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="Experimental Scan Style",
-                 bg="#6B0000", fg="white", font=("", 10, "bold")).pack(anchor="w")
+                 bg="#6B0000", fg="black", font=("", 10, "bold")).pack(anchor="w")
         tk.Label(hdr, text=label[:60] + ("…" if len(label) > 60 else ""),
                  bg="#6B0000", fg="#ffaaaa", font=("", 8)).pack(anchor="w")
 
@@ -1525,10 +1525,10 @@ class PlotWidget(tk.Frame):
         tk.Button(btn, text="Apply",            width=12,
                   command=apply).pack(side=tk.LEFT, padx=3)
         tk.Button(btn, text="Apply to ALL Exp.", width=16,
-                  bg="#004400", fg="white",
+                  bg="#004400", fg="black",
                   command=apply_to_all).pack(side=tk.LEFT, padx=3)
         tk.Button(btn, text="Set as Default",   width=14,
-                  bg="#003366", fg="white",
+                  bg="#003366", fg="black",
                   command=set_as_default).pack(side=tk.LEFT, padx=3)
         tk.Button(btn, text="Factory Reset",    width=12,
                   command=reset_defaults).pack(side=tk.LEFT, padx=3)

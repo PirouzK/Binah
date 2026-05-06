@@ -62,6 +62,7 @@ def save_project(path: str, app) -> None:
     plot = app._plot
     xas  = app._xas_tab
     exafs = getattr(app, "_exafs_tab", None)
+    sim   = getattr(app, "_sim_tab", None)
 
     # ── 1. Loaded ORCA files ─────────────────────────────────────────────────
     orca_files = []
@@ -148,15 +149,19 @@ def save_project(path: str, app) -> None:
     # ── 5. XAS analysis params ───────────────────────────────────────────────
     xas_params = xas.get_params()
     exafs_params = exafs.get_params() if exafs is not None else {}
+    # Simulation Studio tab (FEFF + FDMNES). Distinct dict so old EXAFS-only
+    # projects can still be read back without confusion. Schema bumped to v2.
+    simulation_params = sim.get_params() if sim is not None else {}
 
     doc: dict = {
-        "version":    1,
+        "version":    2,
         "orca_files": orca_files,
         "exp_scans":  exp_scans,
         "overlays":   overlays,
         "plot_state": plot_state,
         "xas_params": xas_params,
         "exafs_params": exafs_params,
+        "simulation_params": simulation_params,
     }
 
     data = json.dumps(doc, indent=2).encode("utf-8")
@@ -185,6 +190,7 @@ def restore_project(doc: dict, app) -> list:
     plot = app._plot
     xas  = app._xas_tab
     exafs = getattr(app, "_exafs_tab", None)
+    sim   = getattr(app, "_sim_tab", None)
     version = doc.get("version", 1)
 
     # ── 1. Clear existing state ──────────────────────────────────────────────
@@ -267,12 +273,32 @@ def restore_project(doc: dict, app) -> list:
     if ep and exafs is not None:
         exafs.set_params(ep)
 
+    # ── 6b. Restore Simulation Studio params ─────────────────────────────────
+    # New in v2. For backward compatibility, when simulation_params is absent
+    # we fall back to whatever's in exafs_params (legacy projects had FEFF
+    # config nested inside exafs_params before the Simulation Studio split).
+    sp_doc = doc.get("simulation_params")
+    if sim is not None:
+        try:
+            if sp_doc is not None:
+                sim.set_params(sp_doc, legacy_exafs_params=ep)
+            elif ep:
+                # v1 project — push legacy FEFF/XYZ keys into the sim tab.
+                sim.set_params({}, legacy_exafs_params=ep)
+        except Exception as exc:
+            warnings.append(f"Could not restore Simulation Studio settings: {exc}")
+
     # ── 7. Refresh UI ────────────────────────────────────────────────────────
     plot._refresh_panel_content()
     plot._replot()
     xas.refresh_scan_list()
     if exafs is not None:
         exafs.refresh_scan_list()
+    if sim is not None:
+        try:
+            sim.refresh_scan_list()
+        except Exception:
+            pass
 
     return warnings
 

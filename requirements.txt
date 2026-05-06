@@ -25,3 +25,7 @@ plotly>=5.0
 
 # Image export (used internally by matplotlib)
 pillow>=9.0
+
+# Simur optional MO/cube analysis helpers
+cclib>=1.8
+scikit-image>=0.22

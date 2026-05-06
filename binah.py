@@ -26,7 +26,7 @@ except ImportError:
     )
     sys.exit(1)
 
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, simpledialog
 
 try:
     from sgm_xas_loader import SGMLoaderApp as _SGMLoaderApp
@@ -39,14 +39,31 @@ from experimental_parser import ExperimentalParser, ExperimentalScan
 from plot_widget import PlotWidget
 from exafs_analysis_tab import EXAFSAnalysisTab
 import feff_manager
+import fdmnes_manager
+from simulation_studio_tab import SimulationStudioTab
 from xas_analysis_tab import XASAnalysisTab
 import project_manager as pm
+
+
+def _resource_path(name: str) -> str:
+    base = getattr(sys, "_MEIPASS", os.path.abspath(os.path.dirname(__file__)))
+    return os.path.join(base, name)
+
+
+def _set_window_icon(win: tk.Tk, png_name: str) -> None:
+    try:
+        icon = tk.PhotoImage(file=_resource_path(png_name))
+        win.iconphoto(True, icon)
+        win._app_icon_ref = icon
+    except Exception:
+        pass
 
 
 class OrcaTDDFTApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Binah")
+        _set_window_icon(self, "Binah.png")
         self.geometry("1100x720")
         self.minsize(800, 550)
 
@@ -109,6 +126,11 @@ class OrcaTDDFTApp(tk.Tk):
         help_menu = tk.Menu(menubar, tearoff=0)
         help_menu.add_command(label="FEFF Setup / Update...",
                               command=self._launch_feff_setup)
+        help_menu.add_command(label="Build Parallel FEFF10 (MPI)...",
+                              command=self._launch_feff_parallel_build)
+        help_menu.add_separator()
+        help_menu.add_command(label="FDMNES Setup...",
+                              command=self._launch_fdmnes_setup)
         help_menu.add_separator()
         help_menu.add_command(label="About", command=self._show_about)
         menubar.add_cascade(label="Help", menu=help_menu)
@@ -182,13 +204,13 @@ class OrcaTDDFTApp(tk.Tk):
         ttk.Separator(sidebar, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=4)
 
         tk.Button(
-            sidebar, text="+ Add to Overlay", bg="#003d7a", fg="white",
+            sidebar, text="+ Add to Overlay", bg="#003d7a", fg="black",
             activebackground="#0055aa", font=("", 9, "bold"),
             command=self._add_current_to_overlay
         ).pack(fill=tk.X, padx=4, pady=(0, 2))
 
         tk.Button(
-            sidebar, text="Load Exp. Data\u2026", bg="#6B0000", fg="white",
+            sidebar, text="Load Exp. Data\u2026", bg="#6B0000", fg="black",
             activebackground="#8B0000", font=("", 9, "bold"),
             command=self._load_experimental
         ).pack(fill=tk.X, padx=4, pady=(0, 2))
@@ -219,6 +241,8 @@ class OrcaTDDFTApp(tk.Tk):
         )
         self._xas_tab.pack(fill=tk.BOTH, expand=True)
 
+        # ── Tab 3: EXAFS Studio (analysis only — FEFF UI moved to
+        # Simulation Studio so this tab can stay focused on q/R-space work).
         exafs_frame = tk.Frame(nb)
         nb.add(exafs_frame, text="EXAFS Studio")
 
@@ -226,10 +250,32 @@ class OrcaTDDFTApp(tk.Tk):
             exafs_frame,
             get_scans_fn=lambda: self._plot._exp_scans,
             replot_fn=lambda: self._plot._replot(),
+            add_exp_scan_fn=self._add_exp_scan_to_plot,
+            show_analysis_panel=True,
+            show_feff_panel=False,
         )
         self._exafs_tab.pack(fill=tk.BOTH, expand=True)
 
-        # Auto-run all scans when analysis tabs are selected
+        # ── Tab 4: Simulation Studio (FEFF + FDMNES engines).
+        sim_frame = tk.Frame(nb)
+        nb.add(sim_frame, text="Simulation Studio")
+
+        self._sim_tab = SimulationStudioTab(
+            sim_frame,
+            get_scans_fn=lambda: self._plot._exp_scans,
+            add_exp_scan_fn=self._add_exp_scan_to_plot,
+            replot_fn=lambda: self._plot._replot(),
+            cfg_path=self._cfg_path,
+        )
+        self._sim_tab.pack(fill=tk.BOTH, expand=True)
+
+        # Wire the FEFF marker overlay in EXAFS Studio's R-space plot to
+        # read live from the Simulation Studio FEFF panel — the FEFF UI
+        # used to live in EXAFS Studio, and the marker provider keeps that
+        # functionality intact across the move.
+        self._exafs_tab.set_feff_paths_provider(self._sim_tab.get_feff_paths)
+
+        # Auto-run analysis when relevant tabs are selected.
         def _on_tab_changed(event):
             try:
                 selected = nb.tab(nb.select(), "text")
@@ -239,6 +285,8 @@ class OrcaTDDFTApp(tk.Tk):
                 elif "XAS" in selected:
                     self._xas_tab.refresh_scan_list()
                     self._xas_tab.auto_run_all()
+                elif "Simulation" in selected:
+                    self._sim_tab.refresh_scan_list()
             except Exception:
                 pass
         nb.bind("<<NotebookTabChanged>>", _on_tab_changed)
@@ -252,13 +300,31 @@ class OrcaTDDFTApp(tk.Tk):
                        anchor="w", padx=6, font=("", 8))
         bar.pack(side=tk.BOTTOM, fill=tk.X)
 
+    def _feff_exe_var(self):
+        """Return the FEFF-executable Tk var on whichever tab owns the FEFF
+        panel. After the Simulation Studio refactor that's the inner FEFF
+        panel inside ``self._sim_tab``; the legacy EXAFS-tab attribute is
+        kept as a fallback so the lookup keeps working for older builds."""
+        sim = getattr(self, "_sim_tab", None)
+        if sim is not None:
+            inner = getattr(sim, "_feff_panel", None)
+            if inner is not None and hasattr(inner, "_feff_exe_var"):
+                return inner._feff_exe_var
+        exafs = getattr(self, "_exafs_tab", None)
+        if exafs is not None and hasattr(exafs, "_feff_exe_var"):
+            return exafs._feff_exe_var
+        return None
+
     def _apply_managed_feff_defaults(self):
         exe = feff_manager.discover_feff_executable(cfg_path=self._cfg_path)
-        if not exe or not hasattr(self, "_exafs_tab"):
+        if not exe:
             return
-        current = self._exafs_tab._feff_exe_var.get().strip()
+        var = self._feff_exe_var()
+        if var is None:
+            return
+        current = str(var.get()).strip()
         if not current or not os.path.exists(current):
-            self._exafs_tab._feff_exe_var.set(exe)
+            var.set(exe)
 
     def _maybe_prompt_feff_setup(self):
         self._apply_managed_feff_defaults()
@@ -299,7 +365,7 @@ class OrcaTDDFTApp(tk.Tk):
             hdr,
             text="Managed FEFF Setup",
             bg="#003366",
-            fg="white",
+            fg="black",
             font=("", 11, "bold"),
         ).pack(anchor="w")
         tk.Label(
@@ -393,8 +459,10 @@ class OrcaTDDFTApp(tk.Tk):
 
         if result and result.get("ok"):
             exe = str(result.get("exe_path", "")).strip()
-            if exe and hasattr(self, "_exafs_tab"):
-                self._exafs_tab._feff_exe_var.set(exe)
+            if exe:
+                var = self._feff_exe_var()
+                if var is not None:
+                    var.set(exe)
             msg = "FEFF10 setup complete."
             self._status.set(msg)
             self._feff_setup_status.set(msg)
@@ -410,6 +478,366 @@ class OrcaTDDFTApp(tk.Tk):
                 self._append_feff_setup_log(
                     "You can retry later from Help -> FEFF Setup / Update."
                 )
+
+    # ------------------------------------------------------------------ #
+    #  Parallel (MPI) FEFF build                                          #
+    # ------------------------------------------------------------------ #
+    def _launch_feff_parallel_build(self):
+        win = getattr(self, "_feff_par_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            return
+
+        # Ask for desired process count first.
+        default_n = max(2, (os.cpu_count() or 4) // 2)
+        n_str = simpledialog.askstring(
+            "Build Parallel FEFF10",
+            "Number of MPI processes to use by default\n"
+            f"(detected {os.cpu_count() or '?'} logical CPUs):",
+            initialvalue=str(default_n),
+            parent=self,
+        )
+        if n_str is None:
+            return
+        try:
+            n_procs = max(1, int(n_str.strip()))
+        except (ValueError, AttributeError):
+            messagebox.showerror("Invalid input",
+                                 "Process count must be a positive integer.")
+            return
+
+        win = tk.Toplevel(self)
+        win.title("Build Parallel FEFF10 (MPI)")
+        win.geometry("760x430")
+        win.minsize(620, 320)
+        win.transient(self)
+
+        hdr = tk.Frame(win, bg="#003366", padx=12, pady=10)
+        hdr.pack(fill=tk.X)
+        tk.Label(
+            hdr, text="MPI Parallel FEFF10 Build", bg="#003366", fg="black",
+            font=("", 11, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text=(
+                f"Compiling MPI variant of FEFF10 to mod/win64_par/. "
+                f"Default processes: {n_procs} (override with FEFF_NPROC env var)."
+            ),
+            bg="#003366", fg="#d7e7ff", wraplength=700, justify="left",
+            font=("", 9),
+        ).pack(anchor="w", pady=(4, 0))
+
+        body = tk.Frame(win, padx=10, pady=8)
+        body.pack(fill=tk.BOTH, expand=True)
+        self._feff_par_log = tk.Text(body, font=("Courier", 8), wrap=tk.WORD)
+        self._feff_par_log.pack(fill=tk.BOTH, expand=True)
+        self._feff_par_log.insert(
+            tk.END,
+            f"Starting MPI build with {n_procs} default processes ...\n\n",
+        )
+        self._feff_par_log.config(state=tk.DISABLED)
+
+        footer = tk.Frame(win, padx=10, pady=8)
+        footer.pack(fill=tk.X)
+        self._feff_par_status = tk.StringVar(value="Building parallel FEFF10 ...")
+        tk.Label(footer, textvariable=self._feff_par_status, anchor="w",
+                 fg="#003366", font=("", 8)).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self._feff_par_close_btn = tk.Button(
+            footer, text="Close", width=12, state=tk.DISABLED,
+            command=win.destroy,
+        )
+        self._feff_par_close_btn.pack(side=tk.RIGHT)
+
+        self._feff_par_win = win
+        self._feff_par_queue = queue.Queue()
+        self._feff_par_n = n_procs
+        thread = threading.Thread(
+            target=self._run_feff_parallel_worker, daemon=True
+        )
+        thread.start()
+        self.after(120, self._poll_feff_parallel_queue)
+
+    def _append_feff_par_log(self, line: str):
+        log = getattr(self, "_feff_par_log", None)
+        if log is None:
+            return
+        log.config(state=tk.NORMAL)
+        log.insert(tk.END, line.rstrip() + "\n")
+        log.see(tk.END)
+        log.config(state=tk.DISABLED)
+
+    def _run_feff_parallel_worker(self):
+        q = self._feff_par_queue
+
+        def _log(message: str):
+            q.put(("log", message))
+
+        result = feff_manager.install_parallel_managed_feff(
+            self._cfg_path, self._feff_par_n, _log
+        )
+        q.put(("done", result))
+
+    def _poll_feff_parallel_queue(self):
+        q = getattr(self, "_feff_par_queue", None)
+        win = getattr(self, "_feff_par_win", None)
+        if q is None or win is None or not win.winfo_exists():
+            return
+
+        done = False
+        result = None
+        while True:
+            try:
+                kind, payload = q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "log":
+                self._append_feff_par_log(str(payload))
+            elif kind == "done":
+                done = True
+                result = payload
+
+        if not done:
+            self.after(120, self._poll_feff_parallel_queue)
+            return
+
+        self._feff_par_close_btn.config(state=tk.NORMAL)
+
+        if result and result.get("ok"):
+            exe = str(result.get("exe_path", "")).strip()
+            self._feff_par_status.set("Parallel FEFF10 build complete.")
+            self._append_feff_par_log("")
+            self._append_feff_par_log(f"Wrapper: {exe}")
+            self._append_feff_par_log(
+                "To use it, point the EXAFS tab's FEFF executable field at this wrapper."
+            )
+            var = self._feff_exe_var() if exe else None
+            if var is not None:
+                if messagebox.askyesno(
+                    "Use Parallel FEFF?",
+                    "Parallel FEFF10 build succeeded. Use the parallel wrapper "
+                    "in Simulation Studio now?",
+                    parent=win,
+                ):
+                    var.set(exe)
+        else:
+            msg = "Parallel FEFF10 build failed."
+            self._feff_par_status.set(msg)
+            if result and result.get("message"):
+                self._append_feff_par_log("")
+                self._append_feff_par_log(f"Result: {result['message']}")
+
+    # ------------------------------------------------------------------ #
+    #  FDMNES setup (manual install picker)                                #
+    # ------------------------------------------------------------------ #
+    def _launch_fdmnes_setup(self):
+        """Open the FDMNES setup dialog.
+
+        FDMNES is registration-walled (https://fdmnes.neel.cnrs.fr/), so we
+        can't auto-download. The dialog shows the download link, lets the
+        user pick fdmnes_win64.exe locally, runs a smoke test, and persists
+        the path to ~/.binah_config.json.
+        """
+        existing = getattr(self, "_fdmnes_setup_win", None)
+        if existing is not None and existing.winfo_exists():
+            existing.lift()
+            existing.focus_force()
+            return
+
+        win = tk.Toplevel(self)
+        win.title("FDMNES Setup")
+        win.geometry("700x640")
+        win.minsize(580, 500)
+        win.transient(self)
+        self._fdmnes_setup_win = win
+
+        hdr = tk.Frame(win, bg="#003366", padx=12, pady=10)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="FDMNES Executable", bg="#003366", fg="black",
+                 font=("", 11, "bold")).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text=("FDMNES (https://fdmnes.neel.cnrs.fr/) is a finite-difference "
+                  "DFT XANES code with proper bound-state pre-edge support. "
+                  "Download the Windows binary, then point Binah at it below."),
+            bg="#003366", fg="#d7e7ff", wraplength=620, justify="left",
+            font=("", 9),
+        ).pack(anchor="w", pady=(4, 0))
+
+        body = tk.Frame(win, padx=12, pady=10)
+        body.pack(fill=tk.BOTH, expand=True)
+
+        # Download link row
+        link_row = tk.Frame(body)
+        link_row.pack(fill=tk.X)
+        tk.Label(link_row, text="1. Download:", font=("", 9, "bold")).pack(side=tk.LEFT)
+        tk.Button(
+            link_row, text="Open fdmnes.neel.cnrs.fr", font=("", 9),
+            fg="#003366", cursor="hand2",
+            command=lambda: self._open_url(fdmnes_manager.FDMNES_DOWNLOAD_URL),
+        ).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(link_row, text="(registration required)",
+                 fg="gray", font=("", 8)).pack(side=tk.LEFT, padx=(8, 0))
+
+        tk.Label(
+            body,
+            text=("After downloading, extract fdmnes_win64.exe somewhere "
+                  "permanent (FDMNES needs its sibling data files alongside)."),
+            justify="left", anchor="w", fg="#444444", font=("", 8),
+            wraplength=620,
+        ).pack(fill=tk.X, pady=(2, 8))
+
+        # Browse row
+        pick_row = tk.Frame(body)
+        pick_row.pack(fill=tk.X)
+        tk.Label(pick_row, text="2. Pick exe:", font=("", 9, "bold")).pack(side=tk.LEFT)
+        path_var = tk.StringVar()
+        existing_state = fdmnes_manager.load_fdmnes_setup_state(self._cfg_path)
+        if existing_state.get("exe_path"):
+            path_var.set(str(existing_state["exe_path"]))
+        ttk.Entry(pick_row, textvariable=path_var, width=60).pack(
+            side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
+
+        def _browse():
+            p = filedialog.askopenfilename(
+                title="Pick fdmnes_win64.exe",
+                filetypes=[("FDMNES executable",
+                            "fdmnes*.exe;fdmnes*"),
+                           ("All files", "*.*")],
+                parent=win,
+            )
+            if p:
+                path_var.set(p)
+
+        tk.Button(pick_row, text="Browse...", font=("", 8),
+                  command=_browse).pack(side=tk.LEFT)
+
+        # ── Parallel (WSL) section ───────────────────────────────────────
+        ttk.Separator(body, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=(10, 6))
+        tk.Label(body, text="Parallel (optional)", font=("", 10, "bold"),
+                 fg="#003366").pack(anchor="w")
+        tk.Label(
+            body,
+            text=("FDMNES also ships a Linux MPI build. With WSL installed, "
+                  "Binah can run the Linux launcher (`mpirun_fdmnes`) for a "
+                  "real MPI parallel run on Windows."),
+            justify="left", anchor="w", fg="#444444", font=("", 8),
+            wraplength=620,
+        ).pack(fill=tk.X, pady=(2, 4))
+
+        wsl_status = ("WSL detected — parallel mode is available."
+                      if fdmnes_manager.discover_wsl_executable() else
+                      "WSL not found. Install WSL first: open admin PowerShell, "
+                      "run `wsl --install`, reboot.")
+        wsl_status_lbl = tk.Label(
+            body, text=wsl_status, fg="#444444", font=("", 8),
+            anchor="w", wraplength=620, justify="left",
+        )
+        wsl_status_lbl.pack(fill=tk.X, pady=(0, 4))
+
+        par_row = tk.Frame(body)
+        par_row.pack(fill=tk.X)
+        tk.Label(par_row, text="Parallel launcher:", font=("", 9, "bold")
+                 ).pack(side=tk.LEFT)
+        par_path_var = tk.StringVar()
+        if existing_state.get("parallel_launcher"):
+            par_path_var.set(str(existing_state["parallel_launcher"]))
+        else:
+            # Pre-populate with the default location if it exists.
+            default_par = fdmnes_manager.discover_parallel_fdmnes_launcher(
+                cfg_path=self._cfg_path
+            )
+            if default_par:
+                par_path_var.set(default_par)
+        ttk.Entry(par_row, textvariable=par_path_var, width=60).pack(
+            side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
+
+        def _browse_par():
+            p = filedialog.askopenfilename(
+                title="Pick mpirun_fdmnes (Linux bash launcher)",
+                filetypes=[("FDMNES launcher", "mpirun_fdmnes*"),
+                           ("All files", "*.*")],
+                parent=win,
+            )
+            if p:
+                par_path_var.set(p)
+
+        tk.Button(par_row, text="Browse...", font=("", 8),
+                  command=_browse_par).pack(side=tk.LEFT)
+
+        # Log
+        tk.Label(body, text="Log:", font=("", 9, "bold")).pack(
+            anchor="w", pady=(8, 2))
+        log_widget = tk.Text(body, height=10, font=("Consolas", 9),
+                             wrap=tk.WORD, state=tk.DISABLED)
+        log_widget.pack(fill=tk.BOTH, expand=True)
+
+        def _log(msg: str):
+            log_widget.config(state=tk.NORMAL)
+            log_widget.insert(tk.END, msg.rstrip() + "\n")
+            log_widget.see(tk.END)
+            log_widget.config(state=tk.DISABLED)
+
+        # Action row
+        actions = tk.Frame(win, padx=12, pady=10)
+        actions.pack(fill=tk.X)
+
+        def _refresh_sim_status():
+            if hasattr(self, "_sim_tab"):
+                try:
+                    self._sim_tab._refresh_fdmnes_status()
+                except Exception:
+                    pass
+
+        def _save_and_verify():
+            picked = path_var.get().strip()
+            par_picked = par_path_var.get().strip()
+            did_anything = False
+            if picked:
+                result = fdmnes_manager.pick_and_install_fdmnes_executable(
+                    self._cfg_path, picked, _log
+                )
+                _log("")
+                _log(result.get("message", "Done."))
+                did_anything = True
+            if par_picked:
+                _log("")
+                par_result = fdmnes_manager.update_parallel_fdmnes_state(
+                    self._cfg_path, par_picked, _log
+                )
+                _log("Parallel: "
+                     + ("OK" if par_result.get("ok") else "needs attention"))
+                did_anything = True
+            if not did_anything:
+                _log("No path selected (serial or parallel).")
+                return
+            _refresh_sim_status()
+
+        def _test_parallel_only():
+            par_picked = par_path_var.get().strip()
+            if not par_picked:
+                _log("No parallel launcher path entered.")
+                return
+            _log("Testing parallel launcher (this may take ~10–30s on first WSL boot) ...")
+            ok, msg = fdmnes_manager.verify_parallel_fdmnes(par_picked)
+            _log(("OK: " if ok else "FAILED: ") + msg)
+
+        tk.Button(actions, text="Verify & Save", font=("", 9, "bold"),
+                  bg="#003366", fg="black", activebackground="#004C99",
+                  command=_save_and_verify).pack(side=tk.LEFT)
+        tk.Button(actions, text="Test parallel", font=("", 8),
+                  command=_test_parallel_only).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Button(actions, text="Close", width=12,
+                  command=win.destroy).pack(side=tk.RIGHT)
+
+    @staticmethod
+    def _open_url(url: str):
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     #  ORCA file operations                                                 #
@@ -580,7 +1008,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr = tk.Frame(win, bg="#003366", pady=6)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="CLS SXRMB Beamline Import",
-                 font=("", 11, "bold"), bg="#003366", fg="white").pack(padx=12)
+                 font=("", 11, "bold"), bg="#003366", fg="black").pack(padx=12)
         tk.Label(hdr, text=os.path.basename(path),
                  font=("", 8), bg="#003366", fg="#AACCFF").pack(padx=12)
 
@@ -623,7 +1051,7 @@ class OrcaTDDFTApp(tk.Tk):
                                      f"Failed to load SXRMB file:\n{e}")
                 self._status.set("Error loading SXRMB file.")
 
-        tk.Button(btn_row, text="Load", width=12, bg="#003366", fg="white",
+        tk.Button(btn_row, text="Load", width=12, bg="#003366", fg="black",
                   activebackground="#0055aa", command=do_load).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Cancel", width=10,
                   command=win.destroy).pack(side=tk.LEFT, padx=4)
@@ -639,7 +1067,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr = tk.Frame(win, bg="#6B0000", padx=12, pady=8)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="BioXAS XDI Import Options",
-                 bg="#6B0000", fg="white", font=("", 11, "bold")).pack(anchor="w")
+                 bg="#6B0000", fg="black", font=("", 11, "bold")).pack(anchor="w")
         tk.Label(hdr, text=os.path.basename(path),
                  bg="#6B0000", fg="#ffaaaa", font=("", 9)).pack(anchor="w")
 
@@ -684,7 +1112,7 @@ class OrcaTDDFTApp(tk.Tk):
 
         btn_row = tk.Frame(win)
         btn_row.pack(pady=(0, 10))
-        tk.Button(btn_row, text="Load", width=12, bg="#6B0000", fg="white",
+        tk.Button(btn_row, text="Load", width=12, bg="#6B0000", fg="black",
                   activebackground="#8B0000", command=do_load).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Cancel", width=10,
                   command=win.destroy).pack(side=tk.LEFT, padx=4)
@@ -726,7 +1154,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr = tk.Frame(win, bg="#6B0000", padx=12, pady=8)
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="Athena Project — Select Scans to Load",
-                 bg="#6B0000", fg="white", font=("", 11, "bold")).pack(anchor="w")
+                 bg="#6B0000", fg="black", font=("", 11, "bold")).pack(anchor="w")
         tk.Label(hdr, text=f"{len(scans)} scan groups found  |  {os.path.basename(path)}",
                  bg="#6B0000", fg="#ffaaaa", font=("", 9)).pack(anchor="w")
 
@@ -775,7 +1203,7 @@ class OrcaTDDFTApp(tk.Tk):
             )
 
         tk.Button(btn_row, text="Load Selected", width=14,
-                  bg="#6B0000", fg="white", activebackground="#8B0000",
+                  bg="#6B0000", fg="black", activebackground="#8B0000",
                   command=do_load).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Select All",  width=10,
                   command=lambda: lb.selection_set(0, tk.END)).pack(side=tk.LEFT, padx=4)
@@ -816,6 +1244,8 @@ class OrcaTDDFTApp(tk.Tk):
             self._xas_tab.refresh_scan_list()
         if hasattr(self, "_exafs_tab"):
             self._exafs_tab.refresh_scan_list()
+        if hasattr(self, "_sim_tab"):
+            self._sim_tab.refresh_scan_list()
 
     # ------------------------------------------------------------------ #
     #  Diagnostic dialog for missing spectrum data                          #
@@ -830,7 +1260,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr.pack(fill=tk.X)
         tk.Label(
             hdr, text="No TDDFT Spectrum Data Found",
-            bg="#8B0000", fg="white", font=("", 11, "bold")
+            bg="#8B0000", fg="black", font=("", 11, "bold")
         ).pack(anchor="w")
         tk.Label(
             hdr, text=os.path.basename(path),
