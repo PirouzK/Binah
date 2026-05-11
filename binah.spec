@@ -2,6 +2,7 @@
 # Build with:  pyinstaller binah.spec
 
 import sys
+from PyInstaller.utils.hooks import collect_data_files
 block_cipher = None
 
 a = Analysis(
@@ -10,6 +11,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('Binah.png', '.'),
+        *collect_data_files('tkinterdnd2'),
         # Include supporting_information.pdf if you want it bundled
         # ('supporting_information.pdf', '.'),
     ],
@@ -42,6 +44,7 @@ a = Analysis(
         'tkinter.filedialog',
         'tkinter.messagebox',
         'tkinter.colorchooser',
+        'tkinterdnd2',
     ],
     hookspath=[],
     hooksconfig={},

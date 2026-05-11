@@ -25,12 +25,23 @@ Element colours follow the Jmol/Avogadro colour scheme.
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+import csv
+import datetime as _dt
+import html
 import json
 import re
 import sys
 import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _HAS_TKDND = True
+except Exception:
+    TkinterDnD = None
+    DND_FILES = None
+    _HAS_TKDND = False
 
 import numpy as np
 import matplotlib
@@ -80,6 +91,25 @@ _DEFAULT_DIR = Path(
     r"F:\OneDrive\OneDrive - University of Calgary"
     r"\Science Work\Nickel Thesis Project\Synthesized complexes\Josiphos"
 )
+_SETTINGS_PATH = Path.home() / ".simur_settings.json"
+
+
+def _load_settings() -> dict:
+    try:
+        if _SETTINGS_PATH.exists():
+            data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_settings(settings: dict) -> None:
+    try:
+        _SETTINGS_PATH.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Element styling
@@ -236,11 +266,15 @@ def parse_loewdin_mo_pops(path: str) -> dict:
     # Collect all lines of the last matching section
     sec_lines: List[str] = []
     in_sec = False
+    analysis_method = ""
 
     with open(path, "r", errors="ignore") as fh:
         for line in fh:
-            if _RE_LORB_SEC.search(line):
+            m_sec = _RE_LORB_SEC.search(line)
+            if m_sec:
                 sec_lines = []
+                method_raw = m_sec.group(1).upper()
+                analysis_method = "Loewdin reduced" if method_raw == "LOEWDIN" else "Mulliken reduced"
                 in_sec = True
                 continue
             if in_sec:
@@ -311,7 +345,13 @@ def parse_loewdin_mo_pops(path: str) -> dict:
         # Initialise MO entries
         for k, mo_i in enumerate(mo_indices):
             if mo_i not in cur:
-                cur[mo_i] = {"label": "", "atoms": {}}
+                cur[mo_i] = {"label": "", "atoms": {}, "analysis": analysis_method}
+            elif analysis_method:
+                cur[mo_i]["analysis"] = analysis_method
+            if k < len(block_ene):
+                cur[mo_i]["energy"] = block_ene[k]
+            if k < len(block_occ):
+                cur[mo_i]["occ"] = block_occ[k]
 
         # ── Data rows: atom populations ───────────────────────────────
         while pos < len(sec_lines):
@@ -1927,10 +1967,48 @@ def _draw_axis_indicator(ax, xs, ys, zs, length_frac: float = 0.12):
             ha="center", va="center")
 
 
+def _draw_origin_axes(ax, xs, ys, zs, magnitudes=(1.0, 1.0, 1.0), length_frac: float = 0.22):
+    """Draw independently-scaled XYZ axes at the true coordinate origin."""
+    if len(xs) == 0:
+        return
+    xmin, xmax = float(xs.min()), float(xs.max())
+    ymin, ymax = float(ys.min()), float(ys.max())
+    zmin, zmax = float(zs.min()), float(zs.max())
+    span = max(xmax - xmin, ymax - ymin, zmax - zmin, 1.0)
+    try:
+        mx, my, mz = [max(0.0, float(v)) for v in magnitudes]
+    except Exception:
+        mx, my, mz = 1.0, 1.0, 1.0
+    base_len = span * length_frac
+    arrow_cfg = dict(arrow_length_ratio=0.18, linewidth=2.4)
+    lx, ly, lz = base_len * mx, base_len * my, base_len * mz
+
+    ax.scatter([0.0], [0.0], [0.0], s=42, c="#FFFFFF",
+               edgecolors="#000000", linewidths=0.8, depthshade=False, zorder=50)
+    if lx > 0:
+        ax.quiver(0, 0, 0, lx, 0, 0, color="#FF4444", **arrow_cfg)
+        ax.text(lx * 1.12, 0, 0, "X", color="#FF4444", fontsize=10, fontweight="bold")
+    if ly > 0:
+        ax.quiver(0, 0, 0, 0, ly, 0, color="#44FF44", **arrow_cfg)
+        ax.text(0, ly * 1.12, 0, "Y", color="#44FF44", fontsize=10, fontweight="bold")
+    if lz > 0:
+        ax.quiver(0, 0, 0, 0, 0, lz, color="#4488FF", **arrow_cfg)
+        ax.text(0, 0, lz * 1.12, "Z", color="#4488FF", fontsize=10, fontweight="bold")
+    ax.text(0, 0, 0, "  0,0,0", color="#FFFFFF", fontsize=8, fontweight="bold")
+
+
 _ISO_QUALITY_STRIDE = {
     "Preview": 3,
     "Balanced": 2,
     "High": 1,
+    "Studio": 1,
+}
+
+_ISO_QUALITY_SMOOTH = {
+    "Preview": 0,
+    "Balanced": 1,
+    "High": 2,
+    "Studio": 3,
 }
 
 
@@ -1948,7 +2026,64 @@ def _surface_edge_color(surface_color, bg_color, on_dark: bool) -> tuple:
     return _blend_rgb(surface_color, blend_target, 0.45 if on_dark else 0.35)
 
 
-def _extract_isosurface_mesh(cube: dict, isovalue: float, stride: int = 1) -> Optional[dict]:
+def _smooth_mesh_vertices(verts: np.ndarray, faces: np.ndarray,
+                          iterations: int = 1, factor: float = 0.35) -> np.ndarray:
+    """Small Laplacian smoothing pass to remove voxel stair-steps from marching cubes."""
+    if iterations <= 0 or len(verts) == 0 or len(faces) == 0:
+        return verts
+    neighbours = [set() for _ in range(len(verts))]
+    for a, b, c in faces:
+        neighbours[a].update((b, c))
+        neighbours[b].update((a, c))
+        neighbours[c].update((a, b))
+    out = verts.astype(float, copy=True)
+    for _ in range(iterations):
+        nxt = out.copy()
+        for i, nbs in enumerate(neighbours):
+            if nbs:
+                avg = out[list(nbs)].mean(axis=0)
+                nxt[i] = (1.0 - factor) * out[i] + factor * avg
+        out = nxt
+    return out
+
+
+def _mesh_face_normals(verts: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    tris = verts[faces]
+    normals = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    mag = np.linalg.norm(normals, axis=1)
+    mag[mag < 1e-12] = 1.0
+    return normals / mag[:, None]
+
+
+def _lit_facecolors(base_color, normals: np.ndarray, alpha: float,
+                    style: str = "Solid") -> np.ndarray:
+    """Generate per-face colours with Chemcraft-like multi-light shading."""
+    base = np.array(mcolors.to_rgb(base_color), dtype=float)
+    lights = [
+        (np.array([0.35, -0.55, 0.76], dtype=float), 0.62),
+        (np.array([-0.65, 0.25, 0.72], dtype=float), 0.26),
+        (np.array([0.15, 0.85, 0.30], dtype=float), 0.12),
+    ]
+    intensity = np.full(len(normals), 0.30)
+    view = np.array([0.2, -0.35, 0.92], dtype=float)
+    view /= np.linalg.norm(view)
+    for light, weight in lights:
+        light /= np.linalg.norm(light)
+        ndotl = np.clip(np.abs(normals @ light), 0.0, 1.0)
+        intensity += weight * ndotl
+    # A small specular term gives lobes that polished, Chemcraft-ish read.
+    spec = np.clip(np.abs(normals @ view), 0.0, 1.0) ** 18
+    intensity = np.clip(intensity, 0.18, 1.08)
+    rgb = base[None, :] * intensity[:, None] + spec[:, None] * 0.22
+    if (style or "").lower() == "glass":
+        rgb = 0.86 * rgb + 0.14
+    rgb = np.clip(rgb, 0.0, 1.0)
+    rgba = np.column_stack((rgb, np.full(len(rgb), alpha)))
+    return rgba
+
+
+def _extract_isosurface_mesh(cube: dict, isovalue: float, stride: int = 1,
+                             smooth: int = 0) -> Optional[dict]:
     """Return cached-ready vertices/faces for an isosurface level."""
     if not _HAS_SKIMAGE:
         return None
@@ -1968,17 +2103,27 @@ def _extract_isosurface_mesh(cube: dict, isovalue: float, stride: int = 1) -> Op
         return None
 
     try:
-        verts, faces, _, _ = _mc(data, level=isovalue, allow_degenerate=False)
+        verts, faces, normals, _ = _mc(data, level=isovalue, allow_degenerate=False)
     except TypeError:
         try:
-            verts, faces, _, _ = _mc(data, level=isovalue)
+            verts, faces, normals, _ = _mc(data, level=isovalue)
         except Exception:
             return None
     except Exception:
         return None
 
     real = np.asarray(cube["origin"]) + verts @ axes
-    return {"verts": real, "faces": faces}
+    if smooth:
+        real = _smooth_mesh_vertices(real, faces, iterations=smooth)
+        normals = _mesh_face_normals(real, faces)
+    else:
+        try:
+            inv_axes = np.linalg.pinv(axes)
+            normals = normals @ inv_axes
+            normals /= np.maximum(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12)
+        except Exception:
+            normals = _mesh_face_normals(real, faces)
+    return {"verts": real, "faces": faces, "normals": normals}
 
 
 def _draw_isosurface_mesh(ax, mesh: dict, color, alpha: float,
@@ -2001,12 +2146,74 @@ def _draw_isosurface_mesh(ax, mesh: dict, color, alpha: float,
     elif st == "mesh":
         face_alpha = min(alpha, 0.18)
 
-    coll.set_facecolor(mcolors.to_rgba(color, face_alpha))
+    normals = mesh.get("normals")
+    if normals is None or len(normals) != len(faces):
+        normals = _mesh_face_normals(verts, faces)
+    face_normals = normals
+    if len(normals) == len(verts):
+        face_normals = normals[faces].mean(axis=1)
+        face_normals /= np.maximum(np.linalg.norm(face_normals, axis=1, keepdims=True), 1e-12)
+    coll.set_facecolor(_lit_facecolors(color, face_normals, face_alpha, style))
     coll.set_edgecolor(edge_color if edge_color is not None else "none")
     coll.set_alpha(face_alpha)
     coll.set_antialiaseds(True)
     ax.add_collection3d(coll)
     return True
+
+
+def _sphere_resolution(quality: str) -> Tuple[int, int]:
+    if quality == "Studio":
+        return 18, 12
+    if quality == "High":
+        return 14, 10
+    return 10, 8
+
+
+def _draw_lit_sphere(ax, center, radius: float, color, alpha: float,
+                     quality: str = "High") -> None:
+    """Draw a shaded atom sphere. Matplotlib is not OpenGL, but this gets close."""
+    nu, nv = _sphere_resolution(quality)
+    u = np.linspace(0, 2 * np.pi, nu)
+    v = np.linspace(0, np.pi, nv)
+    x = center[0] + radius * np.outer(np.cos(u), np.sin(v))
+    y = center[1] + radius * np.outer(np.sin(u), np.sin(v))
+    z = center[2] + radius * np.outer(np.ones_like(u), np.cos(v))
+    ax.plot_surface(
+        x, y, z,
+        color=color,
+        shade=True,
+        linewidth=0,
+        antialiased=True,
+        alpha=alpha,
+        rstride=1,
+        cstride=1,
+    )
+
+
+def _draw_pretty_atoms(ax, xs, ys, zs, names, colours, sizes, style: str,
+                       alpha: float, quality: str, picker: bool = False):
+    if style == "Stick" or quality in {"Preview", "Balanced"} or len(xs) > 180:
+        sc = ax.scatter(xs, ys, zs, c=colours, s=sizes, depthshade=(style != "Stick"),
+                        alpha=alpha, picker=picker)
+        if picker:
+            sc.set_pickradius(8)
+        return sc
+
+    base = 0.11 if style == "Ball & Stick" else 0.34
+    if quality == "Studio":
+        base *= 1.12
+    for x, y, z, elem, col, size in zip(xs, ys, zs, names, colours, sizes):
+        cov = ELEM_RADIUS.get(elem, _DEFAULT_RADIUS)
+        radius = max(0.08, base * cov * (float(size) / 88.0) ** 0.12)
+        if style == "Spacefill":
+            radius = max(0.22, 0.44 * cov)
+        _draw_lit_sphere(ax, (x, y, z), radius, col, alpha, quality)
+    # Invisible picker overlay preserves click-to-label.
+    sc = ax.scatter(xs, ys, zs, c=colours, s=[max(30, s * 0.45) for s in sizes],
+                    alpha=0.01, depthshade=False, picker=picker)
+    if picker:
+        sc.set_pickradius(10)
+    return sc
 
 
 def _render_iso(ax, cube: dict, isovalue: float, color, alpha: float) -> bool:
@@ -2214,7 +2421,7 @@ def _clamp_geometry(win, default_w, default_h, min_w=400, min_h=300):
 #  Application
 # ─────────────────────────────────────────────────────────────────────────────
 
-class SimurApp(tk.Tk):
+class SimurApp((TkinterDnD.Tk if _HAS_TKDND else tk.Tk)):
 
     def __init__(self):
         super().__init__()
@@ -2223,8 +2430,11 @@ class SimurApp(tk.Tk):
         _clamp_geometry(self, 1350, 860, 800, 500)
 
         # State
-        self._files:  Dict[str, Path] = {}       # display_name → .out path
-        self._cache:  Dict[str, dict] = {}        # display_name → parsed data
+        self._files:  Dict[str, Path] = {}       # display_name -> .out path
+        self._cache:  Dict[str, dict] = {}        # display_name -> parsed data
+        self._file_group_items: Dict[str, str] = {}
+        self._file_item_to_name: Dict[str, str] = {}
+        self._file_name_to_item: Dict[str, str] = {}
         self._current: Optional[str]  = None
         self._highlighted: Optional[int] = None   # 1-based Atom# to highlight
         self._cubes: Dict[str, dict]  = {}        # label → cube dict (files + cclib)
@@ -2236,18 +2446,22 @@ class SimurApp(tk.Tk):
         self._style_3d     = tk.StringVar(value="Ball & Stick")
         self._show_H       = tk.BooleanVar(value=False)
         self._show_labels  = tk.BooleanVar(value=False)
-        self._show_axes    = tk.BooleanVar(value=False)  # Avogadro-style XYZ arrows
+        self._show_axes    = tk.BooleanVar(value=False)
+        self._axis_mag_x   = tk.DoubleVar(value=1.0)
+        self._axis_mag_y   = tk.DoubleVar(value=1.0)
+        self._axis_mag_z   = tk.DoubleVar(value=1.0)
         self._clean_bg     = tk.BooleanVar(value=True)   # clean bg (no grid/panes)
         self._measure_mode = tk.StringVar(value="Label")
         self._measure_status = tk.StringVar(value="Pick atoms to label them.")
         self._measure_readout = tk.StringVar(value="No measurement yet")
-        self._iso_quality  = tk.StringVar(value="Balanced")
-        self._iso_surface_style = tk.StringVar(value="Glass")
+        self._iso_quality  = tk.StringVar(value="High")
+        self._iso_surface_style = tk.StringVar(value="Solid")
         self._iso_surface_edges = tk.BooleanVar(value=False)
-        self._iso_mol_alpha = tk.DoubleVar(value=0.92)
+        self._iso_mol_alpha = tk.DoubleVar(value=0.98)
         # Re-orientation: rotation matrix (3x3) and translation (3,)
         self._reorient_R: Optional[np.ndarray] = None     # 3x3 rotation
         self._reorient_T: Optional[np.ndarray] = None     # 3-vector translation
+        self._reorient_by_file: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
         # Per-atom H visibility overrides: set of 0-based atom indices to force-show
         self._force_show_H: set = set()
         # Runtime element colour overrides (persists during session)
@@ -2255,8 +2469,8 @@ class SimurApp(tk.Tk):
         self._iso_pos_on   = tk.BooleanVar(value=True)
         self._iso_neg_on   = tk.BooleanVar(value=True)
         self._iso_mol_on   = tk.BooleanVar(value=True)
-        self._iso_mesh_cache: Dict[Tuple[int, float, int], Optional[dict]] = {}
-        self._iso_mesh_cache_order: List[Tuple[int, float, int]] = []
+        self._iso_mesh_cache: Dict[Tuple[int, float, int, int], Optional[dict]] = {}
+        self._iso_mesh_cache_order: List[Tuple[int, float, int, int]] = []
         self._iso_mesh_cache_token_counter = 0
         self._last_mo_grid_key = None
         self._last_mo_grid_cube: Optional[dict] = None
@@ -2268,10 +2482,26 @@ class SimurApp(tk.Tk):
         self._decomp_pending_after: Optional[str] = None
         self._comp_method_var = tk.StringVar(value="Auto")
         self._comp_method_choices: List[str] = ["Auto", "Raw C^2"]
+        self._settings = _load_settings()
+        self._comparison_files: Dict[str, dict] = {}
+        self._comparison_results: List[dict] = []
+        self._comparison_mo_mode = tk.StringVar(value="Relative to HOMO")
+        self._comparison_mo_value = tk.StringVar(value="0")
+        self._comparison_atom_filter = tk.StringVar(value="")
+        self._comparison_mo_cache: Dict[str, dict] = {}
+        self._comparison_presets: Dict[str, dict] = dict(
+            self._settings.get("comparison_presets", {})
+        )
+        self._comparison_preset_var = tk.StringVar(value="")
+        self._comparison_selected_ao: Optional[str] = None
+        self._comparison_warning_lines: List[str] = []
+        self._tab_records: List[dict] = []
+        self._tab_drag_start: Optional[Tuple[int, int, int]] = None
+        self._load_statuses: Dict[str, dict] = {}
 
         self._build_menu()
         self._build_layout()
-        self._auto_load_dir(_DEFAULT_DIR)
+        self._setup_drag_and_drop()
 
     # ─── Menu ────────────────────────────────────────────────────────────────
 
@@ -2279,8 +2509,12 @@ class SimurApp(tk.Tk):
         mb = tk.Menu(self)
 
         fm = tk.Menu(mb, tearoff=0)
+        fm.add_command(label="Save Simur Project...", command=self._save_project)
+        fm.add_command(label="Load Simur Project...", command=self._load_project)
+        fm.add_separator()
         fm.add_command(label="Open File(s)…",       accelerator="Ctrl+O", command=self._open_files)
         fm.add_command(label="Load from Directory…", command=self._open_dir)
+        fm.add_command(label="Set Default Browse Directory…", command=self._set_default_browse_dir)
         fm.add_separator()
         fm.add_command(label="Exit", command=self.destroy)
         mb.add_cascade(label="File", menu=fm)
@@ -2296,7 +2530,7 @@ class SimurApp(tk.Tk):
         vm.add_separator()
         vm.add_checkbutton(label="Show H atoms",    variable=self._show_H,      command=self._redraw_3d)
         vm.add_checkbutton(label="Show atom labels",variable=self._show_labels,  command=self._redraw_3d)
-        vm.add_checkbutton(label="Show XYZ axes",  variable=self._show_axes,    command=self._redraw_3d)
+        vm.add_checkbutton(label="Show XYZ / origin axes",  variable=self._show_axes,    command=self._redraw_3d)
         vm.add_checkbutton(label="Clean background",variable=self._clean_bg,    command=self._redraw_3d)
         vm.add_separator()
         vm.add_command(label="Manage individual H atoms...", command=self._open_h_manager)
@@ -2322,20 +2556,543 @@ class SimurApp(tk.Tk):
         self._nb = ttk.Notebook(right)
         self._nb.pack(fill=tk.BOTH, expand=True)
 
+        self._tab_records = []
         for title, builder in [
+            ("Dashboard",          self._build_tab_dashboard),
             ("🔬 3D Structure",   self._build_tab_3d),
             ("🧲 NBO Orbitals",   self._build_tab_nbo),
             ("🔄 Interactions",   self._build_tab_e2),
             ("🌐 Isosurface",     self._build_tab_iso),
             ("🔬 Orbital Decomp", self._build_tab_decomp),
+            ("Comparison",          self._build_tab_comparison),
+            ("Load Board",          self._build_tab_load_board),
         ]:
             frame = tk.Frame(self._nb)
             self._nb.add(frame, text=title)
+            self._tab_records.append({"title": title, "frame": frame, "detached": False, "dock_bar": None})
             builder(frame)
+        self._nb.bind("<Double-Button-1>", self._on_notebook_detach_request)
+        self._nb.bind("<ButtonPress-1>", self._on_notebook_tab_press)
+        self._nb.bind("<B1-Motion>", self._on_notebook_tab_drag)
 
         self._status_var = tk.StringVar(value="Open an NBO .out file to begin  (File → Open, or Ctrl+O).")
         tk.Label(self, textvariable=self._status_var, bd=1, relief=tk.SUNKEN,
                  anchor="w", padx=6, font=("", 8)).pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _sync_reorient_for_current(self):
+        transform = self._reorient_by_file.get(self._current)
+        if transform is None:
+            self._reorient_R = None
+            self._reorient_T = None
+        else:
+            self._reorient_R, self._reorient_T = transform
+
+    def _store_reorient_for_file(self, name: str, R: np.ndarray, T: np.ndarray):
+        self._reorient_by_file[name] = (R, T)
+        if name == self._current:
+            self._sync_reorient_for_current()
+        self._refresh_dashboard()
+
+    def _clear_reorient_for_file(self, name: str):
+        self._reorient_by_file.pop(name, None)
+        if name == self._current:
+            self._sync_reorient_for_current()
+        self._refresh_dashboard()
+
+    def _record_for_frame(self, frame) -> Optional[dict]:
+        for rec in self._tab_records:
+            if rec.get("frame") is frame:
+                return rec
+        return None
+
+    def _notebook_tab_index_at(self, event) -> Optional[int]:
+        try:
+            elem = self._nb.identify(event.x, event.y)
+            if "label" not in elem and "padding" not in elem:
+                return None
+            return self._nb.index(f"@{event.x},{event.y}")
+        except Exception:
+            return None
+
+    def _on_notebook_tab_press(self, event):
+        idx = self._notebook_tab_index_at(event)
+        self._tab_drag_start = (idx, event.x_root, event.y_root) if idx is not None else None
+
+    def _on_notebook_tab_drag(self, event):
+        if not self._tab_drag_start:
+            return
+        idx, x0, y0 = self._tab_drag_start
+        if idx is None:
+            return
+        if abs(event.x_root - x0) + abs(event.y_root - y0) < 70:
+            return
+        self._tab_drag_start = None
+        self._detach_tab(idx)
+
+    def _on_notebook_detach_request(self, event):
+        idx = self._notebook_tab_index_at(event)
+        if idx is not None:
+            self._detach_tab(idx)
+
+    def _detach_tab(self, notebook_index: int):
+        try:
+            frame = self._nb.nametowidget(self._nb.tabs()[notebook_index])
+        except Exception:
+            return
+        rec = self._record_for_frame(frame)
+        if not rec or rec.get("detached"):
+            return
+
+        title = rec["title"]
+        self._nb.forget(frame)
+        dock_bar = tk.Frame(frame, bg="#252525")
+        tk.Label(dock_bar, text=f"{title} detached", bg="#252525", fg="white",
+                 font=("", 8, "bold")).pack(side=tk.LEFT, padx=6, pady=2)
+        tk.Button(dock_bar, text="Return to tab bar", font=("", 8),
+                  command=lambda f=frame: self._dock_tab(f)).pack(side=tk.RIGHT, padx=4, pady=2)
+        children = [child for child in frame.winfo_children() if child is not dock_bar]
+        pack_kwargs = {"side": tk.TOP, "fill": tk.X}
+        if children:
+            pack_kwargs["before"] = children[0]
+        try:
+            dock_bar.pack(**pack_kwargs)
+        except Exception:
+            dock_bar.pack(side=tk.TOP, fill=tk.X)
+        rec["dock_bar"] = dock_bar
+        rec["detached"] = True
+        try:
+            self.tk.call("wm", "manage", frame._w)
+            self.tk.call("wm", "title", frame._w, f"{title} - Simur")
+            self.tk.call("wm", "geometry", frame._w, "1200x780")
+            self.tk.call("wm", "protocol", frame._w, "WM_DELETE_WINDOW",
+                         self.register(lambda f=frame: self._dock_tab(f)))
+        except Exception as exc:
+            rec["detached"] = False
+            if dock_bar.winfo_exists():
+                dock_bar.destroy()
+            rec["dock_bar"] = None
+            try:
+                self._nb.add(frame, text=title)
+            except Exception:
+                pass
+            messagebox.showerror("Detach Tab", f"Could not detach tab:\n{exc}", parent=self)
+
+    def _dock_tab(self, frame):
+        rec = self._record_for_frame(frame)
+        if not rec:
+            return
+        try:
+            self.tk.call("wm", "forget", frame._w)
+        except Exception:
+            pass
+        dock_bar = rec.get("dock_bar")
+        if dock_bar is not None and dock_bar.winfo_exists():
+            dock_bar.destroy()
+        rec["dock_bar"] = None
+        if rec.get("detached"):
+            self._nb.add(frame, text=rec["title"])
+            self._nb.select(frame)
+        rec["detached"] = False
+
+    def _save_figure_dialog(self, fig, title: str = "Export Graphic"):
+        path = filedialog.asksaveasfilename(
+            title=title,
+            defaultextension=".png",
+            filetypes=[
+                ("PNG image", "*.png"),
+                ("SVG vector", "*.svg"),
+                ("PDF", "*.pdf"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            fig.savefig(path, dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
+            self._status_var.set(f"Saved graphic: {path}")
+        except Exception as exc:
+            messagebox.showerror("Export Graphic", str(exc), parent=self)
+
+    @staticmethod
+    def _enable_draggable_legends(fig):
+        for ax in fig.axes:
+            leg = ax.get_legend()
+            if leg is not None:
+                try:
+                    leg.set_draggable(True)
+                except Exception:
+                    pass
+
+    def _set_figure_legend_location(self, fig, canvas, loc: str):
+        for ax in fig.axes:
+            handles, labels = ax.get_legend_handles_labels()
+            if not handles:
+                continue
+            old = ax.get_legend()
+            title = old.get_title().get_text() if old is not None else None
+            if old is not None:
+                try:
+                    old.remove()
+                except Exception:
+                    pass
+            if loc == "outside right":
+                leg = ax.legend(handles=handles, labels=labels, loc="center left",
+                                bbox_to_anchor=(1.02, 0.5), fontsize=8,
+                                title=title or None, framealpha=0.75)
+            else:
+                leg = ax.legend(handles=handles, labels=labels, loc=loc, fontsize=8,
+                                title=title or None, framealpha=0.75)
+            try:
+                leg.set_draggable(True)
+            except Exception:
+                pass
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
+        if canvas is not None:
+            canvas.draw_idle()
+
+    def _add_figure_controls(self, parent, fig, canvas, label: str):
+        bar = tk.Frame(parent)
+        bar.pack(fill=tk.X, padx=4, pady=2)
+        tk.Button(bar, text=f"Export {label}", font=("", 8),
+                  command=lambda: self._save_figure_dialog(fig, f"Export {label}")
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Label(bar, text="Legend:", font=("", 8)).pack(side=tk.LEFT, padx=(10, 2))
+        loc_var = tk.StringVar(value="best")
+        loc_cb = ttk.Combobox(
+            bar, textvariable=loc_var, state="readonly", width=14,
+            values=["best", "upper right", "upper left", "lower right",
+                    "lower left", "center right", "center left", "outside right"])
+        loc_cb.pack(side=tk.LEFT)
+        loc_cb.bind("<<ComboboxSelected>>",
+                    lambda _e: self._set_figure_legend_location(fig, canvas, loc_var.get()))
+        tk.Label(bar, text="Legends can also be dragged directly on the plot.",
+                 font=("", 8), fg="gray").pack(side=tk.LEFT, padx=8)
+        return bar
+
+    def _axis_magnitudes(self) -> Tuple[float, float, float]:
+        vals = []
+        for var in (self._axis_mag_x, self._axis_mag_y, self._axis_mag_z):
+            try:
+                vals.append(max(0.0, float(var.get())))
+            except Exception:
+                vals.append(1.0)
+        return vals[0], vals[1], vals[2]
+
+    def _drop_paths_from_event(self, event) -> List[Path]:
+        try:
+            raw_paths = self.tk.splitlist(event.data)
+        except Exception:
+            raw_paths = str(getattr(event, "data", "")).split()
+        return [Path(p) for p in raw_paths if str(p).strip()]
+
+    def _setup_drag_and_drop(self):
+        if not _HAS_TKDND:
+            return
+        try:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_files_dropped)
+            self._status_var.set(
+                "Drag .out/.cube files or folders onto Simur to load them."
+            )
+        except Exception:
+            pass
+
+    def _on_files_dropped(self, event):
+        paths = self._drop_paths_from_event(event)
+        if not paths:
+            return
+        loaded_out = 0
+        loaded_cube = 0
+        loaded_dirs = 0
+        skipped = []
+        first_out = None
+        for path in paths:
+            try:
+                if path.is_dir():
+                    before = len(self._files)
+                    self._auto_load_dir(path)
+                    added = len(self._files) - before
+                    loaded_out += max(0, added)
+                    loaded_dirs += 1
+                    continue
+                ext = path.suffix.lower()
+                if ext == ".out":
+                    key = self._add_file(path, switch=False, group=path.parent.name or "Files")
+                    if key:
+                        loaded_out += 1
+                        first_out = first_out or key
+                elif ext in (".cube", ".cub"):
+                    self._add_cube_file(path)
+                    loaded_cube += 1
+                else:
+                    skipped.append(path.name)
+            except Exception as exc:
+                skipped.append(f"{path.name}: {exc}")
+        if first_out and not self._current:
+            self._select_file_key(first_out)
+        msg = f"Dropped: {loaded_out} .out file(s), {loaded_cube} cube file(s)"
+        if loaded_dirs:
+            msg += f", {loaded_dirs} folder(s) scanned"
+        if skipped:
+            msg += f" | skipped {len(skipped)}"
+        self._status_var.set(msg)
+        if skipped:
+            messagebox.showwarning(
+                "Dropped Files",
+                "Some dropped item(s) were not loaded:\n\n" + "\n".join(skipped[:12]) +
+                ("\n..." if len(skipped) > 12 else ""),
+                parent=self,
+            )
+
+    def _dashboard_counts(self) -> dict:
+        loaded = len(self._files)
+        reoriented = sum(1 for name in self._files if name in self._reorient_by_file)
+        checked = sum(1 for name in self._files
+                      if str(self._ensure_load_status(name).get("state", "")).lower() == "checked")
+        ready_compare = sum(1 for item in self._comparison_files.values()
+                            if item.get("status") == "ready")
+        return {
+            "loaded": loaded,
+            "reoriented": reoriented,
+            "checked": checked,
+            "ready_compare": ready_compare,
+            "comparison_rows": len(getattr(self, "_comparison_results", []) or []),
+        }
+
+    def _dashboard_warnings(self) -> List[str]:
+        warnings: List[str] = []
+        if self._files:
+            missing_ro = [name for name in self._files if name not in self._reorient_by_file]
+            if missing_ro:
+                warnings.append(
+                    f"{len(missing_ro)} loaded file(s) are not re-oriented; AO labels may not compare cleanly."
+                )
+            unscanned = [
+                name for name in self._files
+                if str(self._ensure_load_status(name).get("state", "")).lower() not in ("checked", "base data loaded")
+            ]
+            if unscanned:
+                warnings.append(f"{len(unscanned)} loaded file(s) still need Load Board scanning.")
+        warnings.extend(getattr(self, "_comparison_warning_lines", []) or [])
+        return warnings
+
+    def _refresh_dashboard(self):
+        counts = self._dashboard_counts()
+        text = (
+            f"Loaded files: {counts['loaded']}    "
+            f"Re-oriented: {counts['reoriented']}    "
+            f"Load-board checked: {counts['checked']}    "
+            f"Comparison-ready: {counts['ready_compare']}    "
+            f"AO rows: {counts['comparison_rows']}"
+        )
+        lbl = getattr(self, "_dashboard_summary", None)
+        if lbl is not None:
+            lbl.config(text=text)
+
+        tree = getattr(self, "_dashboard_tree", None)
+        if tree is not None:
+            for item in tree.get_children():
+                tree.delete(item)
+            for name, path in self._files.items():
+                status = self._ensure_load_status(name)
+                ro = "yes" if name in self._reorient_by_file else "no"
+                tree.insert("", tk.END, values=(
+                    name,
+                    path.parent.name,
+                    ro,
+                    status.get("mos", ""),
+                    status.get("pops", ""),
+                    status.get("state", ""),
+                ))
+
+        warn_box = getattr(self, "_dashboard_warnings_box", None)
+        if warn_box is not None:
+            warn_box.config(state=tk.NORMAL)
+            warn_box.delete("1.0", tk.END)
+            warnings = self._dashboard_warnings()
+            warn_box.insert(tk.END, "\n".join(warnings) if warnings else "No current warnings.")
+            warn_box.config(state=tk.DISABLED)
+
+    def _build_tab_dashboard(self, p):
+        top = tk.Frame(p)
+        top.pack(fill=tk.X, padx=8, pady=8)
+        self._dashboard_summary = tk.Label(
+            top, text="", anchor="w", font=("", 10, "bold"), fg="#123c69")
+        self._dashboard_summary.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(top, text="Scan Loaded Files", command=self._scan_all_loaded_files
+                  ).pack(side=tk.RIGHT, padx=2)
+        tk.Button(top, text="Save Project", command=self._save_project
+                  ).pack(side=tk.RIGHT, padx=2)
+
+        warn_frame = tk.LabelFrame(p, text="Apples-to-apples checks", padx=4, pady=4)
+        warn_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self._dashboard_warnings_box = tk.Text(
+            warn_frame, height=4, wrap=tk.WORD, font=("", 9),
+            bg="#fffaf0", relief=tk.FLAT)
+        self._dashboard_warnings_box.pack(fill=tk.X)
+        self._dashboard_warnings_box.config(state=tk.DISABLED)
+
+        cols = ("File", "Directory", "Re-oriented", "MOs", "AO Pops", "State")
+        frame = tk.Frame(p)
+        frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+        hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL)
+        self._dashboard_tree = ttk.Treeview(
+            frame, columns=cols, show="headings",
+            yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.config(command=self._dashboard_tree.yview)
+        hsb.config(command=self._dashboard_tree.xview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self._dashboard_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        widths = {"File": 260, "Directory": 170, "Re-oriented": 90,
+                  "MOs": 150, "AO Pops": 100, "State": 280}
+        for col in cols:
+            self._dashboard_tree.heading(col, text=col)
+            self._dashboard_tree.column(col, width=widths.get(col, 120),
+                                        anchor="center", stretch=True)
+        self._refresh_dashboard()
+
+    def _path_display_key(self, path: str) -> Optional[str]:
+        try:
+            target = Path(path).resolve()
+        except Exception:
+            target = Path(path)
+        for name, loaded_path in self._files.items():
+            try:
+                if loaded_path.resolve() == target:
+                    return name
+            except Exception:
+                if loaded_path == target:
+                    return name
+        return None
+
+    def _ensure_load_status(self, name: str) -> dict:
+        status = self._load_statuses.setdefault(name, {})
+        status.setdefault("coords", "queued")
+        status.setdefault("nbo", "queued")
+        status.setdefault("summary", "queued")
+        status.setdefault("mos", "queued")
+        status.setdefault("pops", "queued")
+        status.setdefault("state", "Queued")
+        return status
+
+    def _update_load_status(self, name: Optional[str], **updates):
+        if not name:
+            return
+        status = self._ensure_load_status(name)
+        status.update(updates)
+        self._refresh_load_board()
+        self._refresh_dashboard()
+
+    def _load_board_row(self, name: str) -> Tuple[str, str, str, str, str, str, str]:
+        status = self._ensure_load_status(name)
+        return (
+            name,
+            str(status.get("coords", "")),
+            str(status.get("nbo", "")),
+            str(status.get("summary", "")),
+            str(status.get("mos", "")),
+            str(status.get("pops", "")),
+            str(status.get("state", "")),
+        )
+
+    def _load_board_tag(self, status: dict) -> str:
+        state = str(status.get("state", "")).lower()
+        if "error" in state or "failed" in state:
+            return "error"
+        if "loading" in state or "scanning" in state:
+            return "loading"
+        vals = [str(status.get(k, "")).lower() for k in ("coords", "nbo", "summary", "mos", "pops")]
+        if vals and all(("ready" in v or "found" in v or v.startswith(("0 ", "no "))) for v in vals):
+            return "ready"
+        return "partial"
+
+    def _refresh_load_board(self):
+        tree = getattr(self, "_load_board_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        ready = 0
+        total = len(self._files)
+        for name in self._files.keys():
+            status = self._ensure_load_status(name)
+            tag = self._load_board_tag(status)
+            if tag == "ready":
+                ready += 1
+            tree.insert("", tk.END, iid=name, values=self._load_board_row(name), tags=(tag,))
+        lbl = getattr(self, "_load_board_status", None)
+        if lbl is not None:
+            lbl.config(text=f"{ready}/{total} loaded file(s) fully checked.",
+                       fg="#006600" if ready == total and total else "gray")
+
+    def _summarize_parsed_data(self, data: dict) -> dict:
+        xyz = data.get("xyz", [])
+        out = data.get("out", {})
+        summary = data.get("summary", {})
+        npa_n = len(out.get("npa", []))
+        nec_n = len(out.get("nec", []))
+        lp_n = len(summary.get("lp", []))
+        bd_n = len(summary.get("bd", []))
+        ry_n = len(summary.get("ry", []))
+        return {
+            "coords": f"{len(xyz)} atoms" if xyz else "missing",
+            "nbo": f"NPA {npa_n}, NEC {nec_n}" if (npa_n or nec_n) else "not found",
+            "summary": f"LP {lp_n}, BD {bd_n}, RY {ry_n}" if (lp_n or bd_n or ry_n) else "not found",
+            "state": "Base data loaded",
+        }
+
+    def _scan_all_loaded_files(self):
+        if not self._files:
+            messagebox.showinfo("Load Board", "No .out files are loaded.", parent=self)
+            return
+        self._load_board_status.config(text="Scanning all loaded files...", fg="gray")
+        for name in list(self._files.keys()):
+            self._update_load_status(name, state="Scanning base data", mos="queued", pops="queued")
+
+        def _task():
+            for name, path in list(self._files.items()):
+                try:
+                    data = self._get_data(name)
+                    self.after(0, lambda n=name, d=data: self._update_load_status(
+                        n, **self._summarize_parsed_data(d)))
+                    basis_text, mo_text = _extract_orca_sections(str(path))
+                    basis = _parse_orca_basis(basis_text) if basis_text else {}
+                    mo_data = _parse_orca_mos(mo_text) if mo_text else None
+                    if mo_data is not None:
+                        nmo = mo_data["coeffs"].shape[1]
+                        nao = mo_data["coeffs"].shape[0]
+                        self._comparison_mo_cache[name] = {
+                            "basis": basis,
+                            "mo_data": mo_data,
+                            "path": str(path),
+                        }
+                        mode = "render+analysis" if basis else "analysis only"
+                        self.after(0, lambda n=name, nmo=nmo, nao=nao, mode=mode:
+                                   self._update_load_status(
+                                       n, mos=f"{nmo} MOs, {nao} AOs ({mode})",
+                                       state="Scanning AO populations"))
+                    else:
+                        self.after(0, lambda n=name: self._update_load_status(
+                            n, mos="not found", state="Scanning AO populations"))
+                    try:
+                        pops = parse_loewdin_mo_pops(str(path))
+                        self.after(0, lambda n=name, p=pops: self._update_load_status(
+                            n, pops=f"{len(p)} MOs" if p else "not found", state="Checked"))
+                    except Exception as exc:
+                        self.after(0, lambda n=name, exc=exc: self._update_load_status(
+                            n, pops="error", state=f"Population parse failed: {exc}"))
+                except Exception as exc:
+                    self.after(0, lambda n=name, exc=exc: self._update_load_status(
+                        n, state=f"Error: {exc}"))
+            self.after(0, lambda: self._load_board_status.config(
+                text="Finished scanning loaded files.", fg="#006600"))
+
+        threading.Thread(target=_task, daemon=True).start()
 
     def _build_sidebar(self, p):
         # File controls
@@ -2351,11 +3108,11 @@ class SimurApp(tk.Tk):
         lf.pack(fill=tk.BOTH, expand=True, padx=4)
         sb = ttk.Scrollbar(lf)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self._lb = tk.Listbox(lf, yscrollcommand=sb.set, selectmode=tk.SINGLE,
-                               exportselection=False, activestyle="dotbox")
+        self._lb = ttk.Treeview(lf, show="tree", selectmode="browse",
+                                yscrollcommand=sb.set)
         self._lb.pack(fill=tk.BOTH, expand=True)
         sb.config(command=self._lb.yview)
-        self._lb.bind("<<ListboxSelect>>", self._on_select)
+        self._lb.bind("<<TreeviewSelect>>", self._on_select)
 
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         tk.Label(p, text="Color", font=("", 8, "bold")).pack(anchor="w", padx=6)
@@ -2372,7 +3129,14 @@ class SimurApp(tk.Tk):
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         ttk.Checkbutton(p, text="Show H atoms",     variable=self._show_H,     command=self._redraw_3d).pack(anchor="w", padx=6)
         ttk.Checkbutton(p, text="Show atom labels", variable=self._show_labels, command=self._redraw_3d).pack(anchor="w", padx=6)
-        ttk.Checkbutton(p, text="Show XYZ axes",   variable=self._show_axes,   command=self._redraw_3d).pack(anchor="w", padx=6)
+        ttk.Checkbutton(p, text="Show XYZ / origin axes",   variable=self._show_axes,   command=self._redraw_3d).pack(anchor="w", padx=6)
+        axis_row = tk.Frame(p)
+        axis_row.pack(anchor="w", padx=16, pady=(1, 3))
+        tk.Label(axis_row, text="Axis X/Y/Z", font=("", 7)).pack(side=tk.LEFT)
+        for var in (self._axis_mag_x, self._axis_mag_y, self._axis_mag_z):
+            ttk.Spinbox(axis_row, textvariable=var, from_=0.0, to=20.0,
+                        increment=0.5, width=4, format="%.1f",
+                        command=self._redraw_3d).pack(side=tk.LEFT, padx=1)
         ttk.Checkbutton(p, text="Clean background", variable=self._clean_bg,   command=self._redraw_3d).pack(anchor="w", padx=6)
         ttk.Separator(p, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=5)
         tk.Button(p, text="Re-orient molecule…", font=("", 8),
@@ -2414,6 +3178,46 @@ class SimurApp(tk.Tk):
             "pick_event", self._on_3d_atom_pick)
         self._3d_click_cid = self._fig_3d.canvas.mpl_connect(
             "button_press_event", self._on_3d_canvas_click)
+
+    def _build_tab_load_board(self, p):
+        top = tk.Frame(p)
+        top.pack(fill=tk.X, padx=6, pady=6)
+        tk.Button(top, text="Scan All Loaded Files", bg="#1a3c6e", fg="black",
+                  font=("", 9, "bold"), command=self._scan_all_loaded_files
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(top, text="Refresh", command=self._refresh_load_board
+                  ).pack(side=tk.LEFT, padx=2)
+        self._load_board_status = tk.Label(
+            top, text="Load status for uploaded .out files.", fg="gray",
+            font=("", 8), anchor="w")
+        self._load_board_status.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+
+        cols = ("File", "Coords", "NBO", "NiSummary", "MOs", "AO Pops", "State")
+        frame = tk.Frame(p)
+        frame.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        vsb = ttk.Scrollbar(frame, orient=tk.VERTICAL)
+        hsb = ttk.Scrollbar(frame, orient=tk.HORIZONTAL)
+        self._load_board_tree = ttk.Treeview(
+            frame, columns=cols, show="headings",
+            yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.config(command=self._load_board_tree.yview)
+        hsb.config(command=self._load_board_tree.xview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self._load_board_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        widths = {
+            "File": 260, "Coords": 80, "NBO": 130, "NiSummary": 140,
+            "MOs": 150, "AO Pops": 100, "State": 260,
+        }
+        for col in cols:
+            self._load_board_tree.heading(col, text=col)
+            self._load_board_tree.column(col, width=widths.get(col, 120),
+                                         anchor="center", stretch=True)
+        self._load_board_tree.tag_configure("ready", foreground="#006600")
+        self._load_board_tree.tag_configure("partial", foreground="#994400")
+        self._load_board_tree.tag_configure("loading", foreground="#444499")
+        self._load_board_tree.tag_configure("error", foreground="#aa0000")
+        self._refresh_load_board()
 
     def _build_measure_overlay(self, parent):
         panel = tk.Frame(parent, bg="#101317", bd=1, relief=tk.RAISED)
@@ -2458,6 +3262,7 @@ class SimurApp(tk.Tk):
         cnbo.draw()
         cnbo.get_tk_widget().pack(fill=tk.X)
         self._canvas_nbo = cnbo
+        self._add_figure_controls(p, self._fig_nbo, self._canvas_nbo, "NBO graphic")
 
         tk.Label(p, text="Natural Electron Configuration  (metals & donors)",
                  font=("", 9, "bold")).pack(anchor="w", padx=6, pady=(4, 0))
@@ -2483,6 +3288,7 @@ class SimurApp(tk.Tk):
         ce2.draw()
         ce2.get_tk_widget().pack(fill=tk.BOTH, expand=True)
         self._canvas_e2 = ce2
+        self._add_figure_controls(p, self._fig_e2, self._canvas_e2, "interaction graphic")
         self._e2_note = tk.Label(p, text="", fg="gray", font=("", 8))
         self._e2_note.pack(anchor="w", padx=6, pady=2)
 
@@ -2608,6 +3414,8 @@ class SimurApp(tk.Tk):
         ttk.Spinbox(r1, textvariable=self._iso_val_var,
                     from_=0.0005, to=1.0, increment=0.005,
                     width=8, format="%.4f").pack(side=tk.LEFT, padx=4)
+        tk.Button(r1, text="Auto", font=("", 8),
+                  command=self._auto_set_orbital_isovalue).pack(side=tk.LEFT, padx=(0, 4))
         # Live-update slider: drag to adjust, renders automatically on mouse release
         self._iso_val_slider = tk.Scale(
             r1, from_=0.0005, to=0.20, resolution=0.0001,
@@ -2633,16 +3441,16 @@ class SimurApp(tk.Tk):
         # + lobe checkbox + colour swatch
         ttk.Checkbutton(r2, text="+ lobe", variable=self._iso_pos_on,
                         command=self._rerender_last_iso).pack(side=tk.LEFT, padx=(4, 0))
-        self._iso_pos_color = tk.StringVar(value="#4169E1")
-        self._pos_swatch = tk.Button(r2, width=3, bg="#4169E1", relief=tk.RAISED,
+        self._iso_pos_color = tk.StringVar(value="#2F80ED")
+        self._pos_swatch = tk.Button(r2, width=3, bg="#2F80ED", relief=tk.RAISED,
                                       command=lambda: self._pick_lobe_color("+"))
         self._pos_swatch.pack(side=tk.LEFT, padx=(2, 8))
 
         # - lobe checkbox + colour swatch
         ttk.Checkbutton(r2, text="- lobe", variable=self._iso_neg_on,
                         command=self._rerender_last_iso).pack(side=tk.LEFT, padx=(4, 0))
-        self._iso_neg_color = tk.StringVar(value="#DD2222")
-        self._neg_swatch = tk.Button(r2, width=3, bg="#DD2222", relief=tk.RAISED,
+        self._iso_neg_color = tk.StringVar(value="#F2994A")
+        self._neg_swatch = tk.Button(r2, width=3, bg="#F2994A", relief=tk.RAISED,
                                       command=lambda: self._pick_lobe_color("-"))
         self._neg_swatch.pack(side=tk.LEFT, padx=(2, 8))
 
@@ -2651,7 +3459,7 @@ class SimurApp(tk.Tk):
 
         r3 = tk.Frame(gc); r3.pack(fill=tk.X, pady=2)
         tk.Label(r3, text="Grid spacing (MO only):").pack(side=tk.LEFT)
-        self._iso_spacing = tk.DoubleVar(value=0.30)
+        self._iso_spacing = tk.DoubleVar(value=0.24)
         ttk.Spinbox(r3, textvariable=self._iso_spacing,
                     from_=0.10, to=0.80, increment=0.05,
                     width=6, format="%.2f").pack(side=tk.LEFT, padx=4)
@@ -2666,7 +3474,7 @@ class SimurApp(tk.Tk):
         tk.Label(r_style, text="Surface:").pack(side=tk.LEFT)
         iso_style_cb = ttk.Combobox(
             r_style, textvariable=self._iso_surface_style,
-            values=("Glass", "Solid", "Mesh"),
+            values=("Solid", "Glass", "Mesh"),
             width=8, state="readonly"
         )
         iso_style_cb.pack(side=tk.LEFT, padx=(4, 8))
@@ -2679,7 +3487,7 @@ class SimurApp(tk.Tk):
         tk.Label(r_style, text="  Quality:").pack(side=tk.LEFT, padx=(8, 2))
         iso_quality_cb = ttk.Combobox(
             r_style, textvariable=self._iso_quality,
-            values=("Preview", "Balanced", "High"),
+            values=("Preview", "Balanced", "High", "Studio"),
             width=9, state="readonly"
         )
         iso_quality_cb.pack(side=tk.LEFT, padx=(2, 8))
@@ -2694,23 +3502,28 @@ class SimurApp(tk.Tk):
         iso_atom_style_cb.pack(side=tk.LEFT, padx=(2, 6))
         iso_atom_style_cb.bind("<<ComboboxSelected>>", self._rerender_last_iso)
 
-        ttk.Checkbutton(r_style, text="XYZ axes", variable=self._show_axes,
+        ttk.Checkbutton(r_style, text="XYZ / origin axes", variable=self._show_axes,
                         command=self._rerender_last_iso).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Label(r_style, text=" X/Y/Z:").pack(side=tk.LEFT, padx=(8, 1))
+        for var in (self._axis_mag_x, self._axis_mag_y, self._axis_mag_z):
+            ttk.Spinbox(r_style, textvariable=var, from_=0.0, to=20.0,
+                        increment=0.5, width=4, format="%.1f",
+                        command=self._rerender_last_iso).pack(side=tk.LEFT, padx=1)
 
         r_view = tk.Frame(gc); r_view.pack(fill=tk.X, pady=2)
         tk.Label(r_view, text="Background:").pack(side=tk.LEFT)
-        self._iso_bg_color = tk.StringVar(value="#1c1c1e")
-        self._bg_swatch = tk.Button(r_view, width=3, bg="#1c1c1e", relief=tk.RAISED,
+        self._iso_bg_color = tk.StringVar(value="#F7F8FB")
+        self._bg_swatch = tk.Button(r_view, width=3, bg="#F7F8FB", relief=tk.RAISED,
                                      command=self._pick_bg_color)
         self._bg_swatch.pack(side=tk.LEFT, padx=(2, 4))
         # Preset background buttons
-        for label, col in [("Black", "#000000"), ("Dark", "#1c1c1e"),
+        for label, col in [("Studio", "#F7F8FB"), ("Black", "#000000"), ("Dark", "#1c1c1e"),
                            ("White", "#FFFFFF"), ("Grey", "#808080")]:
             tk.Button(r_view, text=label, width=5, font=("", 7),
                       command=lambda c=col: self._set_bg_color(c)).pack(side=tk.LEFT, padx=1)
 
         tk.Label(r_view, text="  Atom scale:").pack(side=tk.LEFT, padx=(8, 2))
-        self._iso_atom_scale = tk.DoubleVar(value=1.0)
+        self._iso_atom_scale = tk.DoubleVar(value=1.15)
         ttk.Spinbox(r_view, textvariable=self._iso_atom_scale,
                     from_=0.3, to=3.0, increment=0.1,
                     width=4, format="%.1f").pack(side=tk.LEFT)
@@ -2723,7 +3536,7 @@ class SimurApp(tk.Tk):
         self._iso_mol_alpha_slider.bind("<ButtonRelease-1>", self._rerender_last_iso)
 
         tk.Label(r_view, text="  Bond width:").pack(side=tk.LEFT, padx=(8, 2))
-        self._iso_bond_width = tk.DoubleVar(value=1.8)
+        self._iso_bond_width = tk.DoubleVar(value=2.2)
         ttk.Spinbox(r_view, textvariable=self._iso_bond_width,
                     from_=0.5, to=5.0, increment=0.5,
                     width=4, format="%.1f").pack(side=tk.LEFT)
@@ -2737,6 +3550,13 @@ class SimurApp(tk.Tk):
         tk.Button(r4, text="  Pop Out Window  ", bg="#4a0060", fg="black",
                   activebackground="#6a2080", font=("", 9, "bold"),
                   command=self._popout_render).pack(side=tk.LEFT, padx=8)
+
+        r_preset = tk.Frame(gc); r_preset.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(r_preset, text="Look:").pack(side=tk.LEFT)
+        for name in ("Chemcraft", "Publication", "Fast"):
+            tk.Button(r_preset, text=name, font=("", 8),
+                      command=lambda n=name: self._apply_orbital_preset(n)
+                      ).pack(side=tk.LEFT, padx=2)
 
         self._iso_status = tk.Label(gc, text="", fg="gray", font=("", 8),
                                      anchor="w", justify=tk.LEFT)
@@ -2844,6 +3664,239 @@ class SimurApp(tk.Tk):
 
     # ─── File loading ────────────────────────────────────────────────────────
 
+    def _auto_isovalue_from_cube(self, cube: Optional[dict]) -> Optional[float]:
+        if not cube or "data" not in cube:
+            return None
+        try:
+            vals = np.abs(np.asarray(cube["data"], dtype=float))
+            vals = vals[np.isfinite(vals)]
+            vals = vals[vals > 0]
+            if vals.size == 0:
+                return None
+            level = float(np.percentile(vals, 93.5))
+            vmax = float(np.max(vals))
+            if vmax > 0:
+                level = max(min(level, vmax * 0.72), vmax * 0.015)
+            return max(0.0005, min(level, 1.0))
+        except Exception:
+            return None
+
+    def _auto_set_orbital_isovalue(self):
+        cube = getattr(self, "_last_rendered_cube", None)
+        if cube is None:
+            self._render_iso_tab()
+            cube = getattr(self, "_last_rendered_cube", None)
+        level = self._auto_isovalue_from_cube(cube)
+        if level is None:
+            self._iso_status.config(text="Auto isovalue needs a rendered MO/cube first.", fg="#993300")
+            return
+        self._iso_val_var.set(round(level, 4))
+        self._rerender_last_iso()
+
+    def _apply_orbital_preset(self, name: str):
+        preset = (name or "").lower()
+        if preset == "chemcraft":
+            self._iso_surface_style.set("Solid")
+            self._iso_quality.set("High")
+            self._iso_alpha.set(0.46)
+            self._iso_pos_color.set("#2F80ED")
+            self._iso_neg_color.set("#F2994A")
+            self._iso_bg_color.set("#F7F8FB")
+            self._style_3d.set("Ball & Stick")
+            self._iso_atom_scale.set(1.15)
+            self._iso_bond_width.set(2.2)
+            self._iso_mol_alpha.set(0.98)
+            self._iso_surface_edges.set(False)
+        elif preset == "publication":
+            self._iso_surface_style.set("Solid")
+            self._iso_quality.set("Studio")
+            self._iso_alpha.set(0.52)
+            self._iso_pos_color.set("#1E6FD9")
+            self._iso_neg_color.set("#D94E41")
+            self._iso_bg_color.set("#FFFFFF")
+            self._style_3d.set("Ball & Stick")
+            self._iso_atom_scale.set(1.05)
+            self._iso_bond_width.set(2.0)
+            self._iso_mol_alpha.set(1.0)
+            self._iso_surface_edges.set(False)
+        else:
+            self._iso_surface_style.set("Glass")
+            self._iso_quality.set("Preview")
+            self._iso_alpha.set(0.34)
+            self._iso_pos_color.set("#2F80ED")
+            self._iso_neg_color.set("#F2994A")
+            self._iso_bg_color.set("#FFFFFF")
+            self._style_3d.set("Stick")
+            self._iso_atom_scale.set(0.9)
+            self._iso_bond_width.set(1.6)
+            self._iso_mol_alpha.set(0.92)
+            self._iso_surface_edges.set(False)
+
+        try:
+            self._pos_swatch.config(bg=self._iso_pos_color.get())
+            self._neg_swatch.config(bg=self._iso_neg_color.get())
+            self._bg_swatch.config(bg=self._iso_bg_color.get())
+        except Exception:
+            pass
+        cube = getattr(self, "_last_rendered_cube", None)
+        if cube is not None:
+            auto_level = self._auto_isovalue_from_cube(cube)
+            if auto_level is not None and preset != "fast":
+                self._iso_val_var.set(round(auto_level, 4))
+            self._do_render(cube)
+        else:
+            self._iso_status.config(text=f"{name} look selected. Render an MO to preview it.", fg="#006600")
+
+    def _project_payload(self) -> dict:
+        return {
+            "format": "simur-project",
+            "version": 1,
+            "saved_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "files": [
+                {"name": name, "path": str(path), "group": path.parent.name or "Files"}
+                for name, path in self._files.items()
+            ],
+            "current": self._current,
+            "reorient": {
+                name: {"R": R.tolist(), "T": T.tolist()}
+                for name, (R, T) in self._reorient_by_file.items()
+            },
+            "comparison": {
+                "files": [
+                    {"label": label, "path": str(item.get("path", ""))}
+                    for label, item in self._comparison_files.items()
+                ],
+                "mo_mode": self._comparison_mo_mode.get(),
+                "mo_value": self._comparison_mo_value.get(),
+                "atom_filter": self._comparison_atom_filter.get(),
+                "presets": self._comparison_presets,
+            },
+            "view": {
+                "color_by": self._color_by.get(),
+                "style_3d": self._style_3d.get(),
+                "show_H": bool(self._show_H.get()),
+                "show_labels": bool(self._show_labels.get()),
+                "show_axes": bool(self._show_axes.get()),
+                "axis_magnitudes": list(self._axis_magnitudes()),
+                "clean_bg": bool(self._clean_bg.get()),
+            },
+        }
+
+    def _save_project(self):
+        path = filedialog.asksaveasfilename(
+            title="Save Simur project",
+            defaultextension=".simur.json",
+            filetypes=[("Simur project", "*.simur.json"), ("JSON", "*.json"), ("All files", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text(json.dumps(self._project_payload(), indent=2), encoding="utf-8")
+            self._status_var.set(f"Saved Simur project: {path}")
+        except Exception as exc:
+            messagebox.showerror("Save Project", str(exc), parent=self)
+
+    def _clear_loaded_session(self):
+        for item in list(self._lb.get_children("")):
+            self._lb.delete(item)
+        self._files.clear()
+        self._cache.clear()
+        self._file_group_items.clear()
+        self._file_item_to_name.clear()
+        self._file_name_to_item.clear()
+        self._current = None
+        self._reorient_by_file.clear()
+        self._load_statuses.clear()
+        self._comparison_mo_cache.clear()
+        self._refresh_load_board()
+        self._refresh_dashboard()
+
+    def _load_project(self):
+        path = filedialog.askopenfilename(
+            title="Load Simur project",
+            filetypes=[("Simur project", "*.simur.json"), ("JSON", "*.json"), ("All files", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            if payload.get("format") != "simur-project":
+                raise ValueError("This does not look like a Simur project file.")
+        except Exception as exc:
+            messagebox.showerror("Load Project", str(exc), parent=self)
+            return
+
+        self._clear_loaded_session()
+        missing = []
+        name_map = {}
+        for rec in payload.get("files", []):
+            src = Path(rec.get("path", ""))
+            if not src.exists():
+                missing.append(str(src))
+                continue
+            new_name = self._add_file(src, switch=False, group=rec.get("group") or src.parent.name)
+            if new_name:
+                name_map[rec.get("name") or new_name] = new_name
+
+        for old_name, transform in payload.get("reorient", {}).items():
+            new_name = name_map.get(old_name, old_name)
+            if new_name in self._files:
+                try:
+                    self._reorient_by_file[new_name] = (
+                        np.array(transform["R"], dtype=float),
+                        np.array(transform["T"], dtype=float),
+                    )
+                except Exception:
+                    pass
+
+        view = payload.get("view", {})
+        for var, key in [
+            (self._color_by, "color_by"), (self._style_3d, "style_3d"),
+            (self._show_H, "show_H"), (self._show_labels, "show_labels"),
+            (self._show_axes, "show_axes"), (self._clean_bg, "clean_bg"),
+        ]:
+            if key in view:
+                try:
+                    var.set(view[key])
+                except Exception:
+                    pass
+        mags = view.get("axis_magnitudes")
+        if isinstance(mags, (list, tuple)) and len(mags) >= 3:
+            for var, val in zip((self._axis_mag_x, self._axis_mag_y, self._axis_mag_z), mags[:3]):
+                try:
+                    var.set(float(val))
+                except Exception:
+                    pass
+
+        comp = payload.get("comparison", {})
+        self._comparison_mo_mode.set(comp.get("mo_mode", "Relative to HOMO"))
+        self._comparison_mo_value.set(str(comp.get("mo_value", "0")))
+        self._comparison_atom_filter.set(comp.get("atom_filter", ""))
+        if isinstance(comp.get("presets"), dict):
+            self._comparison_presets = dict(comp["presets"])
+            self._save_comparison_presets()
+        self._comparison_clear_files()
+        self._comparison_add_paths([Path(rec.get("path", "")) for rec in comp.get("files", [])
+                                    if rec.get("path") and Path(rec.get("path", "")).exists()])
+
+        current = name_map.get(payload.get("current"), payload.get("current"))
+        if current in self._files:
+            self._select_file_key(current)
+        elif self._files:
+            self._select_file_key(next(iter(self._files)))
+        self._sync_reorient_for_current()
+        self._refresh_dashboard()
+        self._status_var.set(f"Loaded Simur project: {path}")
+        if missing:
+            messagebox.showwarning(
+                "Load Project",
+                "Some files listed in the project were not found:\n\n" + "\n".join(missing[:12]) +
+                ("\n..." if len(missing) > 12 else ""),
+                parent=self,
+            )
+
     def _open_files(self):
         paths = filedialog.askopenfilenames(
             title="Open NBO .out File(s)",
@@ -2851,12 +3904,41 @@ class SimurApp(tk.Tk):
             initialdir=str(_DEFAULT_DIR) if _DEFAULT_DIR.exists() else ".",
         )
         for p in paths:
-            self._add_file(Path(p))
+            path = Path(p)
+            self._add_file(path, group=path.parent.name or "Files")
+
+    def _default_browse_dir(self) -> Path:
+        saved = self._settings.get("default_browse_dir")
+        if saved:
+            saved_path = Path(saved)
+            if saved_path.exists() and saved_path.is_dir():
+                return saved_path
+        if _DEFAULT_DIR.exists() and _DEFAULT_DIR.is_dir():
+            return _DEFAULT_DIR
+        return Path.home()
+
+    def _set_default_browse_dir(self):
+        d = filedialog.askdirectory(
+            title="Choose default starting folder for directory loads",
+            initialdir=str(self._default_browse_dir()),
+            parent=self,
+        )
+        if not d:
+            return
+        self._settings["default_browse_dir"] = d
+        _save_settings(self._settings)
+        self._status_var.set(f"Default browse directory set to: {d}")
+        messagebox.showinfo(
+            "Default Browse Directory",
+            "Directory-load dialogs will start here:\n\n" + d,
+            parent=self,
+        )
 
     def _open_dir(self):
         d = filedialog.askdirectory(
             title="Load all .out files from directory",
-            initialdir=str(_DEFAULT_DIR) if _DEFAULT_DIR.exists() else ".",
+            initialdir=str(self._default_browse_dir()),
+            parent=self,
         )
         if d:
             self._auto_load_dir(Path(d))
@@ -2864,44 +3946,127 @@ class SimurApp(tk.Tk):
     def _auto_load_dir(self, d: Path):
         if not d.exists():
             return
-        for f in sorted(d.glob("*.out")):
-            self._add_file(f, switch=False)
-        if self._files and not self._current:
-            self._lb.selection_set(0)
-            self._on_select()
+        first_added = None
+        for f in sorted(d.rglob("*.out"), key=lambda p: (str(p.parent).lower(), p.name.lower())):
+            if self._skip_loaded_output_file(f):
+                continue
+            key = self._add_file(f, switch=False, group=self._file_group_for_directory_load(d, f))
+            if key and first_added is None:
+                first_added = key
+        if first_added and not self._current:
+            self._select_file_key(first_added)
 
-    def _add_file(self, path: Path, switch: bool = True):
-        name = path.stem
-        if name in self._files:
-            return
+    @staticmethod
+    def _skip_loaded_output_file(path: Path) -> bool:
+        suffixes = [suffix.lower() for suffix in path.suffixes]
+        return ".smd" in suffixes
+
+    def _file_group_for_directory_load(self, root: Path, path: Path) -> str:
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            return path.parent.name or "Files"
+        if len(rel.parts) > 1:
+            return rel.parts[0]
+        return root.name or "Files"
+
+    def _unique_file_name(self, path: Path, group: str) -> str:
+        base = path.stem
+        if base not in self._files:
+            return base
+        grouped = f"{group} / {base}"
+        if grouped not in self._files:
+            return grouped
+        idx = 2
+        while f"{group} / {base} ({idx})" in self._files:
+            idx += 1
+        return f"{group} / {base} ({idx})"
+
+    def _add_file(self, path: Path, switch: bool = True, group: Optional[str] = None):
+        path = Path(path)
+        if self._skip_loaded_output_file(path):
+            return None
+        for existing in self._files.values():
+            if existing == path:
+                return None
+        group = group or path.parent.name or "Files"
+        name = self._unique_file_name(path, group)
         self._files[name] = path
-        self._lb.insert(tk.END, name)
+        group_item = self._file_group_items.get(group)
+        if group_item is None:
+            group_item = self._lb.insert("", tk.END, text=group, open=True, tags=("group",))
+            self._file_group_items[group] = group_item
+        item = self._lb.insert(group_item, tk.END, text=path.name, tags=("file",))
+        self._file_item_to_name[item] = name
+        self._file_name_to_item[name] = item
+        self._ensure_load_status(name)
+        self._refresh_load_board()
+        self._refresh_dashboard()
         if switch:
-            idx = list(self._files.keys()).index(name)
-            self._lb.selection_clear(0, tk.END)
-            self._lb.selection_set(idx)
-            self._on_select()
+            self._select_file_key(name)
+        return name
+
+    def _select_file_key(self, name: str):
+        item = self._file_name_to_item.get(name)
+        if not item:
+            return
+        parent = self._lb.parent(item)
+        if parent:
+            self._lb.item(parent, open=True)
+        self._lb.selection_set(item)
+        self._lb.focus(item)
+        self._lb.see(item)
+        self._on_select()
 
     def _remove_selected(self):
-        sel = self._lb.curselection()
+        sel = self._lb.selection()
         if not sel:
             return
-        name = self._lb.get(sel[0])
-        self._lb.delete(sel[0])
+        item = sel[0]
+        if item in self._file_item_to_name:
+            self._remove_file_item(item)
+        else:
+            group = self._lb.item(item, "text")
+            for child in list(self._lb.get_children(item)):
+                self._remove_file_item(child, remove_empty_parent=False)
+            self._file_group_items.pop(group, None)
+            self._lb.delete(item)
+
+    def _remove_file_item(self, item: str, remove_empty_parent: bool = True):
+        name = self._file_item_to_name.pop(item, None)
+        if not name:
+            return
+        self._file_name_to_item.pop(name, None)
         self._files.pop(name, None)
         self._cache.pop(name, None)
+        self._reorient_by_file.pop(name, None)
+        self._comparison_mo_cache.pop(name, None)
+        self._load_statuses.pop(name, None)
+        self._refresh_load_board()
+        self._refresh_dashboard()
+        parent = self._lb.parent(item)
+        self._lb.delete(item)
+        if remove_empty_parent and parent and not self._lb.get_children(parent):
+            group = self._lb.item(parent, "text")
+            self._file_group_items.pop(group, None)
+            self._lb.delete(parent)
         if self._current == name:
             self._current = None
 
     # ─── Selection ───────────────────────────────────────────────────────────
 
     def _on_select(self, _ev=None):
-        sel = self._lb.curselection()
+        sel = self._lb.selection()
         if not sel:
             return
-        name = self._lb.get(sel[0])
+        item = sel[0]
+        name = self._file_item_to_name.get(item)
+        if not name:
+            return
         self._current = name
+        self._sync_reorient_for_current()
         self._highlighted = None
+        self._update_load_status(name, state="Loading base data")
         self._status_var.set(f"Loading {name} …")
         self.update_idletasks()
 
@@ -2943,6 +4108,7 @@ class SimurApp(tk.Tk):
         self._draw_3d(name, data)
         self._draw_nbo(name, data)
         self._draw_e2(name, data)
+        self._update_load_status(name, **self._summarize_parsed_data(data))
         if name in self._files:
             self._autoload_mos_for_path(str(self._files[name]))
         n_xyz = len(data["xyz"])
@@ -2981,7 +4147,8 @@ class SimurApp(tk.Tk):
         vis     = [atoms[i] for i in vis_idx]
 
         # Apply re-orientation transform if set
-        if self._reorient_R is not None and self._reorient_T is not None:
+        is_reoriented = self._reorient_R is not None and self._reorient_T is not None
+        if is_reoriented:
             vis = _apply_reorient(vis, self._reorient_R, self._reorient_T)
 
         xs = np.array([a[1] for a in vis])
@@ -3081,11 +4248,12 @@ class SimurApp(tk.Tk):
             self._ax_3d.set_zlabel("Z (Å)", fontsize=8, color="gray")
 
         hi_txt = f"  |  atom {hi} highlighted" if hi else ""
-        self._ax_3d.set_title(f"{name}{hi_txt}", color="white", fontsize=10)
+        ro_txt = "  |  re-oriented" if is_reoriented else ""
+        self._ax_3d.set_title(f"{name}{hi_txt}{ro_txt}", color="white", fontsize=10)
 
         # ── Avogadro-style XYZ axis indicator (small arrows in corner) ───
         if self._show_axes.get():
-            _draw_axis_indicator(self._ax_3d, xs, ys, zs)
+            _draw_origin_axes(self._ax_3d, xs, ys, zs, magnitudes=self._axis_magnitudes())
 
         self._canvas_3d.draw()
 
@@ -3562,6 +4730,7 @@ class SimurApp(tk.Tk):
                                fontsize=8, color="gray", multialignment="center")
             self._ax_nbo2.axis("off")
 
+        self._enable_draggable_legends(self._fig_nbo)
         self._fig_nbo.tight_layout(); self._canvas_nbo.draw()
 
         for item in self._nec_tree.get_children():
@@ -3600,6 +4769,7 @@ class SimurApp(tk.Tk):
                 text=f"Total BD* E₂: {sum(r['E2sum'] for r in bd):.2f} kcal/mol   |   "
                      f"Total RY E₂: {sum(r['E2sum'] for r in ry):.2f} kcal/mol", fg="#333")
 
+        self._enable_draggable_legends(self._fig_e2)
         self._fig_e2.tight_layout(); self._canvas_e2.draw()
 
     # ─── Isosurface: source switching ────────────────────────────────────────
@@ -3677,6 +4847,9 @@ class SimurApp(tk.Tk):
                                 status_prefix: str = "Parsing") -> None:
         """Load MOs from an ORCA .out file at a known path."""
         fname = Path(path).name
+        load_name = self._path_display_key(path)
+        self._update_load_status(load_name, mos="loading", pops="queued",
+                                 state=f"{status_prefix} orbital data")
         self._mo_autoload_in_progress = path
         self._iso_status.config(text=f"{status_prefix} {fname} ...", fg="gray")
         self.update_idletasks()
@@ -3690,16 +4863,18 @@ class SimurApp(tk.Tk):
                 basis = _parse_orca_basis(basis_text) if basis_text else {}
                 mo_data = _parse_orca_mos(mo_text) if mo_text else None
 
-                if mo_data is not None and basis:
+                if mo_data is not None:
                     self.after(0, lambda: self._on_mo_loaded_direct(path, basis, mo_data))
                     return
 
                 if show_help_dialog:
                     self.after(0, lambda: self._show_largeprint_help(path))
                 else:
+                    self.after(0, lambda n=load_name: self._update_load_status(
+                        n, mos="not found", state="MO coefficients missing"))
                     self.after(0, lambda: self._clear_loaded_mos(
-                        status_text=(f"{fname}: no LargePrint MO coefficients found.  "
-                                     f"Rerun ORCA with ! LargePrint if you want MO rendering."),
+                        status_text=(f"{fname}: no MOLECULAR ORBITALS section found.  "
+                                     f"Print MOs with LargePrint or Print[P_MOs]."),
                         status_color="#994400"))
 
             except Exception as exc:
@@ -3707,6 +4882,8 @@ class SimurApp(tk.Tk):
                 if show_help_dialog:
                     self.after(0, lambda: self._show_mo_load_error(msg))
                 else:
+                    self.after(0, lambda n=load_name, msg=msg: self._update_load_status(
+                        n, mos="error", state=f"MO parse failed: {msg[:80]}"))
                     self.after(0, lambda: self._clear_loaded_mos(
                         status_text=f"MO auto-load skipped for {fname}: {msg[:120]}",
                         status_color="#994400"))
@@ -3751,7 +4928,7 @@ class SimurApp(tk.Tk):
                 basis   = _parse_orca_basis(basis_text) if basis_text else {}
                 mo_data = _parse_orca_mos(mo_text) if mo_text else None
 
-                if mo_data is not None and basis:
+                if mo_data is not None:
                     # Success — we have both basis set and MO coefficients
                     self.after(0, lambda: self._on_mo_loaded_direct(path, basis, mo_data))
                     return
@@ -3784,10 +4961,17 @@ class SimurApp(tk.Tk):
 
     def _on_mo_loaded_direct(self, path: str, basis: dict, mo_data: dict):
         """Called when our custom parser successfully extracted MOs."""
+        load_name = self._path_display_key(path)
         self._cclib_data  = None   # not using cclib
         self._orca_mo_path  = path
         self._orca_mo_basis = basis
         self._orca_mo_data  = mo_data
+        if load_name:
+            self._comparison_mo_cache[load_name] = {
+                "basis": basis,
+                "mo_data": mo_data,
+                "path": str(path),
+            }
         self._last_mo_grid_key = None
         self._last_mo_grid_cube = None
         if hasattr(self, "_comp_method_var"):
@@ -3824,12 +5008,31 @@ class SimurApp(tk.Tk):
 
         nao = mo_data["coeffs"].shape[0]
         n_basis = sum(len(sh["prims"]) for shells in basis.values() for sh in shells)
-        self._iso_status.config(
-            text=(f"{nmo} MOs loaded  |  {nao} AOs  |  {n_basis} primitives  |  "
-                  f"HOMO = MO {homo_idx}   ({energies[homo_idx]:.4f} Eh)  |  "
-                  f"Select an MO and click Render."),
-            fg="#006600"
+        has_basis = bool(basis)
+        load_mode = "render+analysis" if has_basis else "analysis only"
+        self._update_load_status(
+            load_name,
+            mos=f"{nmo} MOs, {nao} AOs ({load_mode})",
+            pops="loading",
+            state=("MO coefficients loaded; parsing AO populations"
+                   if has_basis else
+                   "MO coefficients loaded for AO analysis; basis missing for 3D rendering"),
         )
+        if has_basis:
+            status_text = (
+                f"{nmo} MOs loaded  |  {nao} AOs  |  {n_basis} primitives  |  "
+                f"HOMO = MO {homo_idx}   ({energies[homo_idx]:.4f} Eh)  |  "
+                f"Select an MO and click Render."
+            )
+            status_colour = "#006600"
+        else:
+            status_text = (
+                f"{nmo} MOs loaded for AO-character analysis  |  {nao} AOs  |  "
+                f"HOMO = MO {homo_idx} ({energies[homo_idx]:.4f} Eh).  "
+                "3D rendering needs BASIS SET IN INPUT FORMAT or cube files."
+            )
+            status_colour = "#994400"
+        self._iso_status.config(text=status_text, fg=status_colour)
 
         # Also parse Löwdin orbital populations from the same file for decomp tab
         def _parse_pops():
@@ -3842,6 +5045,11 @@ class SimurApp(tk.Tk):
 
     def _show_largeprint_help(self, path: str):
         """Show dialog when .out file does not contain the MO coefficients."""
+        self._update_load_status(
+            self._path_display_key(path),
+            mos="not found",
+            state="MO coefficients missing",
+        )
         self._clear_loaded_mos(
             status_text="No MO section found - see dialog.",
             status_color="red",
@@ -3856,7 +5064,7 @@ class SimurApp(tk.Tk):
                  font=("", 11, "bold"), fg="#cc0000").pack(pady=(14, 2))
         tk.Label(win, text=(
             f"The file  {Path(path).name}  does not contain printed MO coefficients.\n"
-            "ORCA only prints them when you enable LargePrint."
+            "ORCA prints them when you enable LargePrint or Print[P_MOs]."
         ), font=("", 9), justify=tk.LEFT, wraplength=560).pack(padx=12, pady=6)
 
         tk.Label(win, text="Add one of these to your ORCA input and re-run:",
@@ -3873,6 +5081,9 @@ class SimurApp(tk.Tk):
             "%output\n"
             "  Print[ P_MOs ] 1\n"
             "end\n\n"
+            "# 3D rendering directly from .out also needs BASIS SET IN INPUT FORMAT.\n"
+            "# For smaller .out files, keep Print[P_MOs] for AO analysis\n"
+            "# and generate .cube files with orca_plot when you need surfaces.\n\n"
             "# Then re-run ORCA, transfer the new .out to Windows,\n"
             "# and load it here.  The MO tree will populate."
         )
@@ -3884,6 +5095,11 @@ class SimurApp(tk.Tk):
         win.focus_set()
 
     def _on_loewdin_loaded(self, path: str, pops: dict):
+        self._update_load_status(
+            self._path_display_key(path),
+            pops=f"{len(pops)} MOs" if pops else "not found",
+            state="Checked",
+        )
         """Called (on main thread) when Löwdin populations are parsed."""
         self._loewdin_data = pops
         if getattr(self, "_orca_mo_path", None) == path and getattr(self, "_orca_mo_data", None) is not None:
@@ -4081,6 +5297,21 @@ class SimurApp(tk.Tk):
             self.after(0, lambda: self._show_mo_composition(comp, iorb))
         except Exception:
             pass
+
+        if not getattr(self, "_orca_mo_basis", None):
+            msg = (
+                "This file has MO coefficients, so Simur can analyse AO character, "
+                "but it does not include 'BASIS SET IN INPUT FORMAT'.\n\n"
+                "3D MO rendering needs the basis primitives. For small files, keep "
+                "Print[P_MOs] for orbital analysis and generate .cube files with "
+                "orca_plot when you need surfaces."
+            )
+            self._iso_status.config(
+                text="AO character shown; 3D rendering needs printed basis data or cube files.",
+                fg="#994400",
+            )
+            messagebox.showinfo("MO Analysis Only", msg)
+            return
 
         # Capture re-orientation state for the background thread
         ro_R = self._reorient_R
@@ -6281,7 +7512,7 @@ class SimurApp(tk.Tk):
             cube["_iso_mesh_cache_token"] = token
         return int(token)
 
-    def _remember_iso_mesh_cache_key(self, key: Tuple[int, float, int]) -> None:
+    def _remember_iso_mesh_cache_key(self, key: Tuple[int, float, int, int]) -> None:
         if key in self._iso_mesh_cache_order:
             self._iso_mesh_cache_order.remove(key)
         self._iso_mesh_cache_order.append(key)
@@ -6291,12 +7522,13 @@ class SimurApp(tk.Tk):
 
     def _get_cached_iso_mesh(self, cube: dict, isovalue: float) -> Optional[dict]:
         stride = _ISO_QUALITY_STRIDE.get(self._iso_quality.get(), 1)
-        key = (self._get_iso_mesh_cache_token(cube), round(float(isovalue), 6), stride)
+        smooth = _ISO_QUALITY_SMOOTH.get(self._iso_quality.get(), 1)
+        key = (self._get_iso_mesh_cache_token(cube), round(float(isovalue), 6), stride, smooth)
         if key in self._iso_mesh_cache:
             self._remember_iso_mesh_cache_key(key)
             return self._iso_mesh_cache[key]
 
-        mesh = _extract_isosurface_mesh(cube, isovalue, stride=stride)
+        mesh = _extract_isosurface_mesh(cube, isovalue, stride=stride, smooth=smooth)
         self._iso_mesh_cache[key] = mesh
         self._remember_iso_mesh_cache_key(key)
         return mesh
@@ -6314,6 +7546,7 @@ class SimurApp(tk.Tk):
         style = self._style_3d.get()
         surface_style = self._iso_surface_style.get()
         show_edges = self._iso_surface_edges.get()
+        quality = self._iso_quality.get()
 
         target_ax     = ax     if ax     is not None else self._ax_iso
         target_canvas = canvas if canvas is not None else self._canvas_iso
@@ -6367,13 +7600,27 @@ class SimurApp(tk.Tk):
                 line_w = bond_width * (1.15 if style == "Stick" else 1.0)
                 line_alpha = 0.95 if style == "Stick" else 0.82
                 for i, j in _detect_bonds(bond_tuples):
-                    target_ax.plot([xs_m[i], xs_m[j]], [ys_m[i], ys_m[j]], [zs_m[i], zs_m[j]],
-                                   color=bond_color, linewidth=line_w, alpha=line_alpha,
-                                   solid_capstyle="round")
-            sc = target_ax.scatter(xs_m, ys_m, zs_m, c=col_m, s=siz_m,
-                                   depthshade=(style != "Stick"),
-                                   alpha=mol_alpha, picker=True)
-            sc.set_pickradius(8)
+                    x0, y0, z0 = xs_m[i], ys_m[i], zs_m[i]
+                    x1, y1, z1 = xs_m[j], ys_m[j], zs_m[j]
+                    if quality in ("High", "Studio") and style != "Stick":
+                        halo = "#101010" if not on_dark else "#FFFFFF"
+                        target_ax.plot([x0, x1], [y0, y1], [z0, z1],
+                                       color=halo, linewidth=line_w + 1.15,
+                                       alpha=0.28, solid_capstyle="round")
+                    if quality in ("High", "Studio") and i < len(col_m) and j < len(col_m):
+                        xm, ym, zm = (x0 + x1) * 0.5, (y0 + y1) * 0.5, (z0 + z1) * 0.5
+                        target_ax.plot([x0, xm], [y0, ym], [z0, zm],
+                                       color=col_m[i], linewidth=line_w, alpha=line_alpha,
+                                       solid_capstyle="round")
+                        target_ax.plot([xm, x1], [ym, y1], [zm, z1],
+                                       color=col_m[j], linewidth=line_w, alpha=line_alpha,
+                                       solid_capstyle="round")
+                    else:
+                        target_ax.plot([x0, x1], [y0, y1], [z0, z1],
+                                       color=bond_color, linewidth=line_w, alpha=line_alpha,
+                                       solid_capstyle="round")
+            _draw_pretty_atoms(target_ax, xs_m, ys_m, zs_m, names_m, col_m, siz_m,
+                               style, mol_alpha, quality, picker=True)
             if xs_m:
                 extent_sets.append(np.column_stack((xs_m, ys_m, zs_m)))
             # Store atom data for click-to-label (embedded view only)
@@ -6416,11 +7663,15 @@ class SimurApp(tk.Tk):
 
         if self._show_axes.get():
             if xs_m:
-                _draw_axis_indicator(target_ax, np.asarray(xs_m), np.asarray(ys_m), np.asarray(zs_m))
+                _draw_origin_axes(
+                    target_ax, np.asarray(xs_m), np.asarray(ys_m), np.asarray(zs_m),
+                    magnitudes=self._axis_magnitudes())
             elif cube.get("atoms"):
                 axs = np.array([[a[2], a[3], a[4]] for a in cube["atoms"]], dtype=float)
                 if len(axs):
-                    _draw_axis_indicator(target_ax, axs[:, 0], axs[:, 1], axs[:, 2])
+                    _draw_origin_axes(
+                        target_ax, axs[:, 0], axs[:, 1], axs[:, 2],
+                        magnitudes=self._axis_magnitudes())
 
         if extent_sets:
             pts = np.vstack(extent_sets)
@@ -6856,7 +8107,9 @@ class SimurApp(tk.Tk):
 
         # ── Buttons ───────────────────────────────────────────────────────
         btn_frame = tk.Frame(_ro)
-        btn_frame.pack(fill=tk.X, padx=6, pady=6)
+        btn_frame.pack(fill=tk.X, padx=6, pady=(6, 2))
+        batch_frame = tk.Frame(_ro)
+        batch_frame.pack(fill=tk.X, padx=6, pady=(0, 6))
 
         tk.Button(btn_frame, text="Apply Re-orientation", font=("", 10, "bold"),
                   bg="#2a4a00", fg="black",
@@ -6866,9 +8119,19 @@ class SimurApp(tk.Tk):
                   bg="#4a2a00", fg="black",
                   command=lambda: _reset()
                   ).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_frame, text="Compare Before/After", font=("", 9),
+                  command=lambda: _compare_composition()).pack(side=tk.LEFT, padx=8)
         tk.Button(btn_frame, text="Export re-oriented XYZ…", font=("", 9),
                   command=lambda: _export_xyz()
                   ).pack(side=tk.RIGHT, padx=4)
+
+        tk.Label(batch_frame, text="Batch:", font=("", 9, "bold")).pack(side=tk.LEFT, padx=(4, 6))
+        tk.Button(batch_frame, text="Re-orient all uploaded", font=("", 9),
+                  command=lambda: _reorient_all_uploaded()
+                  ).pack(side=tk.LEFT, padx=4)
+        tk.Button(batch_frame, text="Save all XYZ...", font=("", 9),
+                  command=lambda: _save_all_reoriented()
+                  ).pack(side=tk.LEFT, padx=4)
 
         status_lbl = tk.Label(_ro, text="", font=("", 9), fg="green")
         status_lbl.pack(fill=tk.X, padx=6)
@@ -6923,8 +8186,7 @@ class SimurApp(tk.Tk):
             # Rotation matrix: rows are the new basis vectors
             R = np.array([ex, ey, ez])
 
-            self._reorient_R = R
-            self._reorient_T = origin
+            self._store_reorient_for_file(self._current, R, origin)
 
             status_lbl.config(
                 text=(f"Applied: center={atoms[ci][0]}{ci+1}, "
@@ -6933,8 +8195,7 @@ class SimurApp(tk.Tk):
             self._redraw_3d()
 
         def _reset():
-            self._reorient_R = None
-            self._reorient_T = None
+            self._clear_reorient_for_file(self._current)
             status_lbl.config(text="Reset to original orientation.")
             self._redraw_3d()
 
@@ -6956,6 +8217,126 @@ class SimurApp(tk.Tk):
                 for el, x, y, z in transformed:
                     f.write(f"{el:4s} {x:14.8f} {y:14.8f} {z:14.8f}\n")
             messagebox.showinfo("Saved", f"Exported to:\n{path}")
+
+        def _reorient_all_uploaded():
+            if not self._files:
+                messagebox.showinfo("Re-orient all", "No uploaded files are available.")
+                return
+            try:
+                ci = int(center_var.get()) - 1
+                xi = int(xaxis_var.get()) - 1
+                yi = int(xyplane_var.get()) - 1
+            except ValueError:
+                messagebox.showerror("Re-orient all", "Enter valid atom numbers (1-based).")
+                return
+
+            def _make_transform(src_atoms):
+                n = len(src_atoms)
+                if not (0 <= ci < n and 0 <= xi < n and 0 <= yi < n):
+                    raise ValueError(f"atom numbers must be 1-{n}")
+                if len({ci, xi, yi}) < 3:
+                    raise ValueError("three different atoms are required")
+
+                origin = np.array([src_atoms[ci][1], src_atoms[ci][2], src_atoms[ci][3]])
+                p_x = np.array([src_atoms[xi][1], src_atoms[xi][2], src_atoms[xi][3]])
+                p_y = np.array([src_atoms[yi][1], src_atoms[yi][2], src_atoms[yi][3]])
+
+                vx = p_x - origin
+                vx_norm = np.linalg.norm(vx)
+                if vx_norm < 1e-10:
+                    raise ValueError("X-axis atom is at the same position as center")
+                ex = vx / vx_norm
+
+                vy_raw = p_y - origin
+                vy = vy_raw - np.dot(vy_raw, ex) * ex
+                vy_norm = np.linalg.norm(vy)
+                if vy_norm < 1e-10:
+                    raise ValueError("XY-plane atom is collinear with center and X-axis atom")
+                ey = vy / vy_norm
+
+                ez = np.cross(ex, ey)
+                ez = ez / np.linalg.norm(ez)
+                return np.array([ex, ey, ez]), origin
+
+            ok = 0
+            failures = []
+            for name in list(self._files.keys()):
+                try:
+                    data = self._get_data(name)
+                    src_atoms = data.get("xyz", [])
+                    if not src_atoms:
+                        raise ValueError("no coordinates found")
+                    R, T = _make_transform(src_atoms)
+                    self._store_reorient_for_file(name, R, T)
+                    ok += 1
+                except Exception as exc:
+                    failures.append(f"{name}: {exc}")
+
+            self._sync_reorient_for_current()
+            self._redraw_3d()
+            status_lbl.config(
+                text=f"Re-oriented {ok} uploaded molecule(s) in the active session." +
+                     (f"  {len(failures)} failed." if failures else ""))
+            if failures:
+                messagebox.showwarning(
+                    "Re-orient all",
+                    "Some files could not be re-oriented:\n\n" + "\n".join(failures[:12]) +
+                    ("\n..." if len(failures) > 12 else ""))
+            else:
+                messagebox.showinfo(
+                    "Re-orient all",
+                    f"Re-oriented {ok} active file(s). Use Save all re-oriented XYZ to export copies.")
+
+        def _save_all_reoriented():
+            if not self._files:
+                messagebox.showinfo("Save all", "No uploaded files are available.")
+                return
+            if not self._reorient_by_file:
+                messagebox.showinfo("Save all", "No files have an active re-orientation yet.")
+                return
+
+            out_dir = filedialog.askdirectory(title="Choose folder for re-oriented XYZ files")
+            if not out_dir:
+                return
+
+            def _safe_export_name(name: str) -> str:
+                clean = re.sub(r'[<>:"/\\\\|?*]+', "_", name).strip(" ._")
+                return clean or "molecule"
+
+            ok = 0
+            failures = []
+            for name in list(self._files.keys()):
+                transform = self._reorient_by_file.get(name)
+                if transform is None:
+                    failures.append(f"{name}: not re-oriented")
+                    continue
+                try:
+                    data = self._get_data(name)
+                    src_atoms = data.get("xyz", [])
+                    if not src_atoms:
+                        raise ValueError("no coordinates found")
+                    R, T = transform
+                    transformed = _apply_reorient(src_atoms, R, T)
+                    out_path = Path(out_dir) / f"{_safe_export_name(name)}_reoriented.xyz"
+                    with open(out_path, "w") as f:
+                        f.write(f"{len(transformed)}\n")
+                        f.write(f"Re-oriented coordinates from {name}\n")
+                        for el, x, y, z in transformed:
+                            f.write(f"{el:4s} {x:14.8f} {y:14.8f} {z:14.8f}\n")
+                    ok += 1
+                except Exception as exc:
+                    failures.append(f"{name}: {exc}")
+
+            status_lbl.config(
+                text=f"Saved {ok} re-oriented XYZ file(s)." +
+                     (f"  {len(failures)} skipped/failed." if failures else ""))
+            if failures:
+                messagebox.showwarning(
+                    "Save all",
+                    "Some files could not be saved:\n\n" + "\n".join(failures[:12]) +
+                    ("\n..." if len(failures) > 12 else ""))
+            else:
+                messagebox.showinfo("Save all", f"Exported {ok} re-oriented XYZ file(s).")
 
         def _compare_composition():
             """Show before/after comparison of orbital decomposition for selected MO."""
@@ -7019,10 +8400,6 @@ class SimurApp(tk.Tk):
 
             tree_c.tag_configure("big_change", foreground="#FF6600")
 
-        # Add compare button to the button frame
-        tk.Button(btn_frame, text="Compare Before/After", font=("", 9),
-                  command=_compare_composition).pack(side=tk.LEFT, padx=8)
-
     # ─── Click-to-label atoms on isosurface view ─────────────────────────────
 
     def _on_iso_atom_pick(self, event):
@@ -7061,6 +8438,775 @@ class SimurApp(tk.Tk):
         self._canvas_iso.draw_idle()
 
     # ─── Orbital Decomp tab ───────────────────────────────────────────────────
+
+    # ─── Comparison tab ───────────────────────────────────────────────────────
+
+    def _build_tab_comparison(self, p):
+        self._comparison_status = tk.Label(
+            p, text="Add ORCA .out files with Loewdin/Mulliken reduced orbital populations.",
+            fg="gray", font=("", 8), anchor="w", padx=6)
+        self._comparison_status.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
+
+        top = tk.Frame(p)
+        top.pack(side=tk.TOP, fill=tk.X, padx=4, pady=3)
+        tk.Button(top, text="Add Output Files", bg="#1a3c6e", fg="black",
+                  font=("", 9, "bold"), command=self._comparison_add_files
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(top, text="Add Loaded Files", command=self._comparison_add_loaded
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(top, text="Remove", command=self._comparison_remove_selected
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(top, text="Analyse", bg="#1a6e3c", fg="black",
+                  command=self._comparison_analyse).pack(side=tk.LEFT, padx=(10, 2))
+        tk.Button(top, text="Pop-out", command=self._comparison_popout
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(top, text="Export CSV", command=self._comparison_export_csv
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(top, text="Export Report", command=self._comparison_export_report
+                  ).pack(side=tk.LEFT, padx=2)
+
+        opts = tk.Frame(p)
+        opts.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4))
+        tk.Label(opts, text="MO:", font=("", 8, "bold")).pack(side=tk.LEFT)
+        self._comparison_mode_cb = ttk.Combobox(
+            opts, textvariable=self._comparison_mo_mode,
+            values=["Relative to HOMO", "Absolute MO index"],
+            state="readonly", width=18)
+        self._comparison_mode_cb.pack(side=tk.LEFT, padx=(4, 4))
+        tk.Entry(opts, textvariable=self._comparison_mo_value, width=8,
+                 font=("Courier", 9)).pack(side=tk.LEFT)
+        tk.Label(opts, text="Atoms:", font=("", 8, "bold")).pack(side=tk.LEFT, padx=(12, 2))
+        tk.Entry(opts, textvariable=self._comparison_atom_filter, width=42,
+                 font=("Courier", 9)).pack(side=tk.LEFT)
+        tk.Label(opts, text="blank = all; examples: Ni1 or Ni1,P2,Cl85",
+                 font=("", 8), fg="gray").pack(side=tk.LEFT, padx=6)
+
+        preset_row = tk.Frame(p)
+        preset_row.pack(side=tk.TOP, fill=tk.X, padx=6, pady=(0, 4))
+        tk.Label(preset_row, text="Preset:", font=("", 8, "bold")).pack(side=tk.LEFT)
+        self._comparison_preset_cb = ttk.Combobox(
+            preset_row, textvariable=self._comparison_preset_var,
+            values=sorted(self._comparison_presets.keys()), width=24)
+        self._comparison_preset_cb.pack(side=tk.LEFT, padx=4)
+        tk.Button(preset_row, text="Apply", command=self._comparison_apply_preset
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(preset_row, text="Save Current", command=self._comparison_save_preset
+                  ).pack(side=tk.LEFT, padx=2)
+        tk.Button(preset_row, text="Delete", command=self._comparison_delete_preset
+                  ).pack(side=tk.LEFT, padx=2)
+
+        self._comparison_warning = tk.Label(
+            p, text="", fg="#994400", font=("", 8), anchor="w", padx=6, justify=tk.LEFT)
+        self._comparison_warning.pack(side=tk.TOP, fill=tk.X)
+
+        body = tk.PanedWindow(p, orient=tk.HORIZONTAL, sashwidth=5, sashrelief=tk.RAISED)
+        body.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        left = tk.LabelFrame(body, text="Complexes to compare", padx=4, pady=4)
+        body.add(left, minsize=230)
+        sb = ttk.Scrollbar(left, orient=tk.VERTICAL)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._comparison_lb = tk.Listbox(
+            left, selectmode=tk.EXTENDED, exportselection=False,
+            yscrollcommand=sb.set, width=34, font=("Courier", 9))
+        self._comparison_lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.config(command=self._comparison_lb.yview)
+        self._comparison_lb.bind("<<ListboxSelect>>",
+                                 lambda _e: self._comparison_update_method_board())
+
+        method_frame = tk.LabelFrame(left, text="Population analysis", padx=2, pady=2)
+        method_frame.pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
+        self._comparison_method_tree = ttk.Treeview(
+            method_frame, columns=("Complex", "Analysis"), show="headings", height=5)
+        self._comparison_method_tree.heading("Complex", text="Complex")
+        self._comparison_method_tree.heading("Analysis", text="Analysis")
+        self._comparison_method_tree.column("Complex", width=150, anchor="w", stretch=True)
+        self._comparison_method_tree.column("Analysis", width=120, anchor="center", stretch=True)
+        self._comparison_method_tree.pack(fill=tk.X)
+
+        right = tk.Frame(body)
+        body.add(right, minsize=720)
+
+        self._comparison_tree_frame = tk.Frame(right)
+        self._comparison_tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self._comparison_tree = None
+        self._comparison_make_tree(["AO"])
+
+        plot_frame = tk.LabelFrame(right, text="AO character comparison", padx=2, pady=2)
+        plot_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, pady=(4, 0))
+        self._comparison_fig = Figure(figsize=(7.5, 3.2), dpi=96)
+        self._comparison_ax = self._comparison_fig.add_subplot(111)
+        self._comparison_ax.set_visible(False)
+        self._comparison_canvas = FigureCanvasTkAgg(self._comparison_fig, master=plot_frame)
+        self._add_figure_controls(plot_frame, self._comparison_fig,
+                                  self._comparison_canvas, "comparison graphic")
+        self._comparison_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self._comparison_canvas.mpl_connect("pick_event", self._comparison_on_chart_pick)
+
+    def _comparison_make_tree(self, cols):
+        for child in self._comparison_tree_frame.winfo_children():
+            child.destroy()
+        vsb = ttk.Scrollbar(self._comparison_tree_frame, orient=tk.VERTICAL)
+        hsb = ttk.Scrollbar(self._comparison_tree_frame, orient=tk.HORIZONTAL)
+        self._comparison_tree = ttk.Treeview(
+            self._comparison_tree_frame, columns=cols, show="headings",
+            yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.config(command=self._comparison_tree.yview)
+        hsb.config(command=self._comparison_tree.xview)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self._comparison_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        for col in cols:
+            width = 140 if col == "AO" else 110
+            self._comparison_tree.heading(col, text=col)
+            self._comparison_tree.column(col, width=width, anchor="center", stretch=True)
+        self._comparison_tree.bind("<<TreeviewSelect>>", self._comparison_on_tree_select)
+
+    def _comparison_add_files(self):
+        paths = filedialog.askopenfilenames(
+            title="Add ORCA output files for orbital comparison",
+            filetypes=[("ORCA Output", "*.out"), ("All files", "*.*")],
+            initialdir=str(_DEFAULT_DIR) if _DEFAULT_DIR.exists() else ".",
+        )
+        self._comparison_add_paths([Path(p) for p in paths])
+
+    def _comparison_add_loaded(self):
+        self._comparison_add_paths(list(self._files.values()))
+
+    def _comparison_add_paths(self, paths):
+        pending = []
+        for path in paths:
+            if not path:
+                continue
+            path = Path(path)
+            label = self._comparison_label_for_path(path)
+            suffix = 1
+            while label in self._comparison_files:
+                label = f"{self._comparison_label_for_path(path)}_{suffix}"
+                suffix += 1
+            self._comparison_files[label] = {
+                "path": path, "pops": {}, "status": "loading", "analysis": "loading",
+            }
+            self._comparison_lb.insert(tk.END, label)
+            pending.append(label)
+        self._comparison_update_method_board()
+        if pending:
+            self._comparison_status.config(
+                text=f"Parsing orbital populations from {len(pending)} file(s)...",
+                fg="gray")
+            threading.Thread(target=self._comparison_parse_pending,
+                             args=(pending,), daemon=True).start()
+
+    @staticmethod
+    def _comparison_label_for_path(path: Path) -> str:
+        directory = path.parent.name.strip()
+        name = path.stem.strip()
+        return f"{directory} - {name}" if directory else name
+
+    @staticmethod
+    def _comparison_population_method(pops: dict) -> str:
+        for entry in pops.values():
+            method = entry.get("analysis")
+            if method:
+                return str(method)
+        return "Unknown"
+
+    def _comparison_update_method_board(self):
+        tree = getattr(self, "_comparison_method_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children():
+            tree.delete(item)
+        labels = list(self._comparison_files.keys())
+        for label in labels:
+            item = self._comparison_files.get(label, {})
+            status = item.get("status", "queued")
+            method = item.get("analysis") or status
+            tree.insert("", tk.END, values=(label, method))
+
+    def _comparison_parse_pending(self, labels):
+        for label in labels:
+            item = self._comparison_files.get(label)
+            if not item:
+                continue
+            try:
+                pops = parse_loewdin_mo_pops(str(item["path"]))
+                mo_data = self._comparison_get_mo_data_for_item(item, label)
+                def _ok(label=label, pops=pops, mo_data=mo_data):
+                    if label in self._comparison_files:
+                        self._comparison_files[label]["pops"] = pops
+                        if pops:
+                            self._comparison_files[label]["analysis"] = self._comparison_population_method(pops)
+                            self._comparison_files[label]["status"] = "ready"
+                        elif mo_data is not None:
+                            self._comparison_files[label]["analysis"] = "Raw C^2 from MO coefficients"
+                            self._comparison_files[label]["status"] = "ready"
+                        else:
+                            self._comparison_files[label]["analysis"] = "not found"
+                            self._comparison_files[label]["status"] = "no populations"
+                        self._comparison_refresh_status()
+                self.after(0, _ok)
+            except Exception as exc:
+                def _fail(label=label, exc=exc):
+                    if label in self._comparison_files:
+                        self._comparison_files[label]["status"] = f"error: {exc}"
+                        self._comparison_files[label]["analysis"] = "error"
+                        self._comparison_refresh_status()
+                self.after(0, _fail)
+
+    def _comparison_refresh_status(self):
+        total = len(self._comparison_files)
+        ready = sum(1 for item in self._comparison_files.values()
+                    if item.get("status") == "ready")
+        bad = total - ready
+        self._comparison_status.config(
+            text=f"{ready}/{total} comparison file(s) ready" +
+                 (f"  |  {bad} missing/failed" if bad else ""),
+            fg="#005500" if ready else "#994400")
+        self._comparison_update_method_board()
+        self._refresh_dashboard()
+
+    def _comparison_remove_selected(self):
+        for idx in sorted(self._comparison_lb.curselection(), reverse=True):
+            label = self._comparison_lb.get(idx)
+            self._comparison_lb.delete(idx)
+            self._comparison_files.pop(label, None)
+        self._comparison_refresh_status()
+
+    def _comparison_clear_files(self):
+        self._comparison_files.clear()
+        self._comparison_results = []
+        self._comparison_warning_lines = []
+        if getattr(self, "_comparison_lb", None) is not None:
+            self._comparison_lb.delete(0, tk.END)
+        self._comparison_make_tree(["AO"])
+        if getattr(self, "_comparison_ax", None) is not None:
+            self._comparison_ax.cla()
+            self._comparison_ax.set_visible(False)
+            self._comparison_canvas.draw_idle()
+        self._comparison_refresh_status()
+
+    def _save_comparison_presets(self):
+        self._settings["comparison_presets"] = self._comparison_presets
+        _save_settings(self._settings)
+        cb = getattr(self, "_comparison_preset_cb", None)
+        if cb is not None:
+            cb.config(values=sorted(self._comparison_presets.keys()))
+
+    def _comparison_current_preset_payload(self) -> dict:
+        return {
+            "mo_mode": self._comparison_mo_mode.get(),
+            "mo_value": self._comparison_mo_value.get(),
+            "atom_filter": self._comparison_atom_filter.get(),
+            "files": [
+                {"label": label, "path": str(item.get("path", ""))}
+                for label, item in self._comparison_files.items()
+            ],
+        }
+
+    def _comparison_save_preset(self):
+        name = (self._comparison_preset_var.get() or "").strip()
+        if not name:
+            name = f"Comparison {len(self._comparison_presets) + 1}"
+            self._comparison_preset_var.set(name)
+        if not self._comparison_files:
+            messagebox.showinfo("Comparison Preset", "Add comparison files before saving a preset.", parent=self)
+            return
+        self._comparison_presets[name] = self._comparison_current_preset_payload()
+        self._save_comparison_presets()
+        self._comparison_status.config(text=f"Saved comparison preset: {name}", fg="#005500")
+
+    def _comparison_apply_preset(self):
+        name = (self._comparison_preset_var.get() or "").strip()
+        preset = self._comparison_presets.get(name)
+        if not preset:
+            messagebox.showinfo("Comparison Preset", "Choose a saved preset first.", parent=self)
+            return
+        self._comparison_mo_mode.set(preset.get("mo_mode", "Relative to HOMO"))
+        self._comparison_mo_value.set(str(preset.get("mo_value", "0")))
+        self._comparison_atom_filter.set(preset.get("atom_filter", ""))
+        self._comparison_clear_files()
+        missing = []
+        paths = []
+        for rec in preset.get("files", []):
+            path = Path(rec.get("path", ""))
+            if path.exists():
+                paths.append(path)
+            else:
+                missing.append(str(path))
+        self._comparison_add_paths(paths)
+        if missing:
+            messagebox.showwarning(
+                "Comparison Preset",
+                "Some preset files were not found:\n\n" + "\n".join(missing[:12]) +
+                ("\n..." if len(missing) > 12 else ""),
+                parent=self,
+            )
+
+    def _comparison_delete_preset(self):
+        name = (self._comparison_preset_var.get() or "").strip()
+        if name in self._comparison_presets:
+            self._comparison_presets.pop(name, None)
+            self._comparison_preset_var.set("")
+            self._save_comparison_presets()
+            self._comparison_status.config(text=f"Deleted comparison preset: {name}", fg="#994400")
+
+    def _comparison_selected_labels(self):
+        sel = self._comparison_lb.curselection()
+        labels = [self._comparison_lb.get(i) for i in sel]
+        if not labels:
+            labels = list(self._comparison_files.keys())
+        return [label for label in labels
+                if self._comparison_files.get(label, {}).get("status") == "ready"]
+
+    @staticmethod
+    def _comparison_homo_idx(pops):
+        occ_mos = [mo for mo, entry in pops.items()
+                   if float(entry.get("occ", 0.0)) > 0.5]
+        if occ_mos:
+            return max(occ_mos)
+        return min(pops.keys()) if pops else 0
+
+    def _comparison_resolve_mo(self, pops):
+        raw = self._comparison_mo_value.get().strip() or "0"
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError("MO value must be an integer.")
+        if self._comparison_mo_mode.get() == "Relative to HOMO":
+            return self._comparison_homo_idx(pops) + value
+        return value
+
+    def _comparison_resolve_mo_for_item(self, item: dict, label: str) -> int:
+        pops = item.get("pops") or {}
+        raw = self._comparison_mo_value.get().strip() or "0"
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ValueError("MO value must be an integer.")
+        if self._comparison_mo_mode.get() != "Relative to HOMO":
+            return value
+        if pops:
+            return self._comparison_homo_idx(pops) + value
+        mo_data = self._comparison_get_mo_data_for_item(item, label)
+        if mo_data is not None:
+            occs = np.asarray(mo_data.get("occs", []), dtype=float)
+            if len(occs):
+                occ_idx = np.where(occs > 0.5)[0]
+                homo = int(occ_idx.max()) if len(occ_idx) else 0
+                return homo + value
+        return value
+
+    def _comparison_atom_filter_set(self):
+        raw = self._comparison_atom_filter.get().strip()
+        if not raw:
+            return None
+        return {part.strip() for part in raw.replace(";", ",").split(",") if part.strip()}
+
+    @staticmethod
+    def _comparison_ao_vector(entry, atom_filter=None):
+        values = {}
+        for atom_key, atom in entry.get("atoms", {}).items():
+            if atom_filter is not None and atom_key not in atom_filter:
+                continue
+            ao = atom.get("ao") or {}
+            if ao:
+                for ao_key, value in ao.items():
+                    values[ao_key] = values.get(ao_key, 0.0) + float(value) * 100.0
+            else:
+                for key in ("s", "p", "d", "f_orb"):
+                    values[key] = values.get(key, 0.0) + float(atom.get(key, 0.0)) * 100.0
+        return values
+
+    def _comparison_get_mo_data_for_item(self, item: dict, label: str) -> Optional[dict]:
+        display_name = self._path_display_key(str(item.get("path", "")))
+        cache_key = display_name or label
+        cached = self._comparison_mo_cache.get(cache_key)
+        if cached and cached.get("mo_data") is not None:
+            return cached["mo_data"]
+
+        path = item.get("path")
+        if not path:
+            return None
+        basis_text, mo_text = _extract_orca_sections(str(path))
+        basis = _parse_orca_basis(basis_text) if basis_text else {}
+        mo_data = _parse_orca_mos(mo_text) if mo_text else None
+        if mo_data is None:
+            return None
+        self._comparison_mo_cache[cache_key] = {
+            "basis": basis,
+            "mo_data": mo_data,
+            "path": str(path),
+        }
+        return mo_data
+
+    @staticmethod
+    def _comparison_vector_from_comp(comp: dict, atom_filter=None) -> dict:
+        if atom_filter is None:
+            return {ang: pct for ang, pct in comp.get("summed_ao_types", [])}
+        values = {}
+        details = comp.get("atom_ao_detail", {})
+        for atom_key in atom_filter:
+            for ang, pct in details.get(atom_key, {}).items():
+                values[ang] = values.get(ang, 0.0) + pct
+        return values
+
+    def _comparison_reoriented_ao_vector(self, item: dict, label: str,
+                                         mo_idx: int, atom_filter=None) -> Optional[Tuple[dict, str]]:
+        display_name = self._path_display_key(str(item.get("path", "")))
+        if not display_name:
+            return None
+        transform = self._reorient_by_file.get(display_name)
+        if transform is None:
+            return None
+        mo_data = self._comparison_get_mo_data_for_item(item, label)
+        if not mo_data:
+            return None
+        nmo = mo_data["coeffs"].shape[1]
+        if not (0 <= mo_idx < nmo):
+            return None
+        mo_data = dict(mo_data)
+        if item.get("pops"):
+            mo_data["reduced_populations"] = item["pops"]
+        comp = compute_mo_composition(
+            mo_data, mo_idx,
+            reorient_R=transform[0],
+            method="reduced" if item.get("pops") else "auto",
+        )
+        analysis = item.get("analysis") or comp.get("method_label", "Re-oriented")
+        return self._comparison_vector_from_comp(comp, atom_filter), f"Re-oriented {analysis}"
+
+    @staticmethod
+    def _comparison_channel_sort_key(channel):
+        order = {"s": 0, "px": 1, "py": 2, "pz": 3,
+                 "dxy": 4, "dyz": 5, "dz2": 6, "dxz": 7, "dx2y2": 8,
+                 "f": 9, "f_orb": 9}
+        return (order.get(channel, 99), channel)
+
+    def _comparison_update_warnings(self, complexes: Optional[List[dict]] = None):
+        warnings: List[str] = []
+        if complexes:
+            analysis_set = {item.get("analysis", "Unknown") for item in complexes}
+            frame_set = {
+                "re-oriented" if str(item.get("analysis", "")).startswith("Re-oriented") else "ORCA-frame"
+                for item in complexes
+            }
+            pop_set = {
+                str(item.get("analysis", "")).replace("Re-oriented ", "").replace("ORCA-frame ", "")
+                for item in complexes
+            }
+            if len(frame_set) > 1:
+                warnings.append("Mixed frames: some rows use re-oriented AO character and some use ORCA-frame output.")
+            if len(pop_set) > 1:
+                warnings.append("Mixed population analyses: " + ", ".join(sorted(pop_set)))
+            missing_loaded = [
+                item["label"] for item in complexes
+                if self._path_display_key(str(self._comparison_files.get(item["label"], {}).get("path", "")))
+                and not str(item.get("analysis", "")).startswith("Re-oriented")
+            ]
+            if missing_loaded:
+                warnings.append("Loaded comparison files without active reorientation: " + ", ".join(missing_loaded[:4]))
+            if not self._comparison_atom_filter.get().strip():
+                warnings.append("Atom filter is blank, so this compares total AO character across all atoms.")
+        self._comparison_warning_lines = warnings
+        lbl = getattr(self, "_comparison_warning", None)
+        if lbl is not None:
+            lbl.config(text="\n".join(warnings), fg="#994400" if warnings else "gray")
+        self._refresh_dashboard()
+
+    def _comparison_on_tree_select(self, _event=None):
+        tree = getattr(self, "_comparison_tree", None)
+        if tree is None:
+            return
+        sel = tree.selection()
+        if not sel:
+            return
+        values = tree.item(sel[0], "values")
+        if not values:
+            return
+        self._comparison_selected_ao = values[0]
+        if getattr(self, "_comparison_results", None) and getattr(self, "_comparison_result_complexes", None):
+            self._comparison_draw_chart(self._comparison_result_complexes, self._comparison_results)
+
+    def _comparison_on_chart_pick(self, event):
+        ao = getattr(event.artist, "_simur_ao", None)
+        if not ao:
+            return
+        self._comparison_selected_ao = ao
+        tree = getattr(self, "_comparison_tree", None)
+        if tree is not None:
+            for iid in tree.get_children():
+                values = tree.item(iid, "values")
+                if values and values[0] == ao:
+                    tree.selection_set(iid)
+                    tree.see(iid)
+                    break
+        if getattr(self, "_comparison_results", None) and getattr(self, "_comparison_result_complexes", None):
+            self._comparison_draw_chart(self._comparison_result_complexes, self._comparison_results)
+
+    def _comparison_analyse(self):
+        labels = self._comparison_selected_labels()
+        if len(labels) < 2:
+            messagebox.showinfo("Comparison", "Select at least two ready output files.", parent=self)
+            return
+        atom_filter = self._comparison_atom_filter_set()
+
+        per_complex = []
+        missing = []
+        for label in labels:
+            item = self._comparison_files[label]
+            pops = item["pops"]
+            try:
+                mo_idx = self._comparison_resolve_mo_for_item(item, label)
+            except Exception as exc:
+                messagebox.showerror("Comparison", str(exc), parent=self)
+                return
+            mo_data = self._comparison_get_mo_data_for_item(item, label)
+            if mo_idx not in pops and mo_data is None:
+                missing.append(f"{label}: MO {mo_idx}")
+                continue
+            ro_vector = self._comparison_reoriented_ao_vector(item, label, mo_idx, atom_filter)
+            if ro_vector is not None:
+                ao_vector, analysis_label = ro_vector
+                entry = pops.get(mo_idx, {})
+            else:
+                if mo_idx in pops:
+                    entry = pops[mo_idx]
+                    ao_vector = self._comparison_ao_vector(entry, atom_filter)
+                    analysis_label = f"ORCA-frame {item.get('analysis') or entry.get('analysis') or 'Unknown'}"
+                elif mo_data is not None and 0 <= mo_idx < mo_data["coeffs"].shape[1]:
+                    comp = compute_mo_composition(mo_data, mo_idx, reorient_R=None, method="raw")
+                    entry = {
+                        "energy": float(mo_data["energies"][mo_idx]) if mo_idx < len(mo_data["energies"]) else None,
+                        "occ": float(mo_data["occs"][mo_idx]) if mo_idx < len(mo_data["occs"]) else None,
+                    }
+                    ao_vector = self._comparison_vector_from_comp(comp, atom_filter)
+                    analysis_label = "ORCA-frame Raw C^2 from MO coefficients"
+                else:
+                    missing.append(f"{label}: MO {mo_idx}")
+                    continue
+            per_complex.append({
+                "label": label,
+                "mo_idx": mo_idx,
+                "analysis": analysis_label,
+                "energy": entry.get("energy"),
+                "occ": entry.get("occ"),
+                "ao": ao_vector,
+            })
+
+        if len(per_complex) < 2:
+            messagebox.showwarning(
+                "Comparison",
+                "Fewer than two selected files had the requested MO.\n\n" + "\n".join(missing),
+                parent=self)
+            return
+
+        channels = sorted(
+            {ch for item in per_complex for ch in item["ao"]},
+            key=self._comparison_channel_sort_key)
+        rows = []
+        ref = per_complex[0]
+        for channel in channels:
+            vals = [item["ao"].get(channel, 0.0) for item in per_complex]
+            if max(vals) < 0.05:
+                continue
+            rows.append({
+                "ao": channel,
+                "values": vals,
+                "range": max(vals) - min(vals),
+                "delta": vals[-1] - vals[0],
+            })
+        rows.sort(key=lambda row: row["range"], reverse=True)
+
+        self._comparison_results = rows
+        self._comparison_result_complexes = per_complex
+        self._comparison_update_warnings(per_complex)
+        cols = ["AO"] + [
+            f"{item['label']} MO {item['mo_idx']} ({item['analysis']})"
+            for item in per_complex
+        ] + ["Range", "Last-First"]
+        self._comparison_make_tree(cols)
+        for row in rows:
+            vals = [row["ao"]] + [f"{v:.2f}" for v in row["values"]] + [
+                f"{row['range']:.2f}", f"{row['delta']:+.2f}"]
+            self._comparison_tree.insert("", tk.END, iid=f"ao:{row['ao']}", values=vals)
+
+        self._comparison_draw_chart(per_complex, rows)
+        detail = "; ".join(
+            f"{item['label']}: {item['analysis']}, MO {item['mo_idx']}" +
+            (f" ({item['energy']:.4f} Eh)" if item.get("energy") is not None else "")
+            for item in per_complex)
+        self._comparison_status.config(
+            text=f"Compared {len(per_complex)} complexes | {len(rows)} AO channel(s) | {detail}",
+            fg="#005500")
+        if missing:
+            messagebox.showwarning("Comparison", "Skipped missing MOs:\n\n" + "\n".join(missing), parent=self)
+
+    def _comparison_draw_chart(self, complexes, rows, ax=None, fig=None, canvas=None):
+        ax = ax or self._comparison_ax
+        fig = fig or self._comparison_fig
+        canvas = canvas or self._comparison_canvas
+        ax.cla()
+        ax.set_visible(True)
+        top_rows = rows[:14]
+        if not top_rows:
+            ax.text(0.5, 0.5, "No AO contributions above threshold.",
+                    ha="center", va="center", transform=ax.transAxes)
+            canvas.draw_idle()
+            return
+        y = np.arange(len(top_rows))
+        n = len(complexes)
+        height = min(0.8 / max(n, 1), 0.22)
+        cmap = plt.get_cmap("tab10")
+        for i, item in enumerate(complexes):
+            vals = [row["values"][i] for row in top_rows]
+            bars = ax.barh(y + (i - (n - 1) / 2) * height, vals,
+                           height=height, color=cmap(i % 10), label=item["label"],
+                           picker=True)
+            for bar, row in zip(bars, top_rows):
+                bar._simur_ao = row["ao"]
+                if row["ao"] == self._comparison_selected_ao:
+                    bar.set_edgecolor("black")
+                    bar.set_linewidth(1.8)
+                    bar.set_alpha(1.0)
+                else:
+                    bar.set_alpha(0.78 if self._comparison_selected_ao else 1.0)
+        ax.set_yticks(y)
+        ax.set_yticklabels([row["ao"] for row in top_rows], fontsize=9)
+        ax.invert_yaxis()
+        ax.set_xlabel("AO character (%)")
+        ax.set_title("Largest AO-character differences")
+        ax.grid(axis="x", alpha=0.2, linestyle=":")
+        leg = ax.legend(fontsize=7, loc="lower right")
+        try:
+            leg.set_draggable(True)
+        except Exception:
+            pass
+        fig.tight_layout()
+        canvas.draw_idle()
+
+    def _comparison_popout(self):
+        if not getattr(self, "_comparison_results", None):
+            messagebox.showinfo("Comparison", "Run an analysis first.", parent=self)
+            return
+        win = tk.Toplevel(self)
+        win.title("Orbital AO Character Comparison")
+        _clamp_geometry(win, 1050, 720, 700, 450)
+        _set_window_icon(win, "Simur.png")
+        top = tk.Frame(win)
+        top.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        cols = ["AO"] + [
+            f"{item['label']} MO {item['mo_idx']} ({item.get('analysis', 'Unknown')})"
+            for item in self._comparison_result_complexes
+        ] + ["Range", "Last-First"]
+        tree = ttk.Treeview(top, columns=cols, show="headings", height=14)
+        vsb = ttk.Scrollbar(top, orient=tk.VERTICAL, command=tree.yview)
+        tree.config(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        tree.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        for col in cols:
+            tree.heading(col, text=col)
+            tree.column(col, width=130 if col != "AO" else 110, anchor="center", stretch=True)
+        for row in self._comparison_results:
+            tree.insert("", tk.END, values=(
+                [row["ao"]] + [f"{v:.2f}" for v in row["values"]] +
+                [f"{row['range']:.2f}", f"{row['delta']:+.2f}"]))
+        fig = Figure(figsize=(9, 3.8), dpi=96)
+        ax = fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(fig, master=win)
+        self._add_figure_controls(win, fig, canvas, "comparison pop-out")
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        self._comparison_draw_chart(self._comparison_result_complexes,
+                                    self._comparison_results, ax=ax, fig=fig, canvas=canvas)
+
+    def _comparison_export_csv(self):
+        if not getattr(self, "_comparison_results", None):
+            messagebox.showinfo("Comparison", "Run an analysis first.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export AO comparison CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV", "*.csv"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        headers = ["AO"] + [
+            f"{item['label']} MO {item['mo_idx']} {item.get('analysis', 'Unknown')} (%)"
+            for item in self._comparison_result_complexes
+        ] + ["Range (%)", "Last-First (%)"]
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(headers)
+                for row in self._comparison_results:
+                    writer.writerow(
+                        [row["ao"]] + [f"{v:.6g}" for v in row["values"]] +
+                        [f"{row['range']:.6g}", f"{row['delta']:.6g}"])
+            self._comparison_status.config(text=f"Exported comparison CSV: {path}", fg="#005500")
+        except Exception as exc:
+            messagebox.showerror("Export Error", str(exc), parent=self)
+
+    def _comparison_export_report(self):
+        if not getattr(self, "_comparison_results", None):
+            messagebox.showinfo("Comparison", "Run an analysis first.", parent=self)
+            return
+        path = filedialog.asksaveasfilename(
+            title="Export comparison report",
+            defaultextension=".html",
+            filetypes=[("HTML report", "*.html"), ("All files", "*.*")],
+            parent=self,
+        )
+        if not path:
+            return
+        out_path = Path(path)
+        image_path = out_path.with_suffix(".png")
+        try:
+            self._comparison_fig.savefig(image_path, dpi=220, bbox_inches="tight",
+                                         facecolor=self._comparison_fig.get_facecolor())
+            headers = ["AO"] + [
+                f"{item['label']} MO {item['mo_idx']} ({item.get('analysis', 'Unknown')})"
+                for item in self._comparison_result_complexes
+            ] + ["Range", "Last-First"]
+            table_rows = []
+            for row in self._comparison_results:
+                vals = [row["ao"]] + [f"{v:.2f}" for v in row["values"]] + [
+                    f"{row['range']:.2f}", f"{row['delta']:+.2f}"]
+                table_rows.append("<tr>" + "".join(f"<td>{html.escape(str(v))}</td>" for v in vals) + "</tr>")
+            warnings = self._comparison_warning_lines or ["No current comparison warnings."]
+            complex_lines = [
+                f"{item['label']}: MO {item['mo_idx']}, {item.get('analysis', 'Unknown')}"
+                for item in self._comparison_result_complexes
+            ]
+            doc = f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<title>Simur AO Comparison Report</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 28px; color: #202020; }}
+h1 {{ font-size: 22px; margin-bottom: 4px; }}
+h2 {{ font-size: 16px; margin-top: 24px; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
+th, td {{ border: 1px solid #ccc; padding: 5px 7px; text-align: right; }}
+th:first-child, td:first-child {{ text-align: left; }}
+th {{ background: #eef2f6; }}
+.warn {{ background: #fff6df; border-left: 4px solid #c28600; padding: 8px 12px; }}
+img {{ max-width: 100%; border: 1px solid #ddd; }}
+</style></head><body>
+<h1>Simur AO Comparison Report</h1>
+<p>Generated {html.escape(_dt.datetime.now().strftime("%Y-%m-%d %H:%M"))}</p>
+<h2>Complexes</h2>
+<ul>{''.join(f'<li>{html.escape(line)}</li>' for line in complex_lines)}</ul>
+<h2>Checks</h2>
+<div class="warn">{'<br>'.join(html.escape(w) for w in warnings)}</div>
+<h2>Graphic</h2>
+<img src="{html.escape(image_path.name)}" alt="AO comparison graphic">
+<h2>AO Character</h2>
+<table><thead><tr>{''.join(f'<th>{html.escape(h)}</th>' for h in headers)}</tr></thead>
+<tbody>{''.join(table_rows)}</tbody></table>
+</body></html>"""
+            out_path.write_text(doc, encoding="utf-8")
+            self._comparison_status.config(text=f"Exported report: {out_path}", fg="#005500")
+        except Exception as exc:
+            messagebox.showerror("Export Report", str(exc), parent=self)
 
     _DECOMP_LCOLOURS = [
         "#4e9a4e", "#4d79c7", "#cc5555", "#888800",
@@ -7147,6 +9293,8 @@ class SimurApp(tk.Tk):
         self._decomp_ax  = self._decomp_fig.add_subplot(111)
         self._decomp_ax.set_visible(False)
         self._decomp_canvas = FigureCanvasTkAgg(self._decomp_fig, master=plot_frame)
+        self._add_figure_controls(plot_frame, self._decomp_fig,
+                                  self._decomp_canvas, "orbital-decomp graphic")
         self._decomp_canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
     def _decomp_add_row(self, name_hint: str = ""):
@@ -7273,8 +9421,12 @@ class SimurApp(tk.Tk):
         ax.set_xlim(0, max(sum(g[k] for k in ("s","p","d","f")) for g in groups) * 1.20 + 0.02)
         ax.invert_yaxis()
         ax.set_title(f"Orbital character — {label}  (MO {mo_idx})", fontsize=10)
-        ax.legend(loc="lower right", fontsize=8, title="\u2113", title_fontsize=8,
-                  framealpha=0.7)
+        leg = ax.legend(loc="lower right", fontsize=8, title="\u2113", title_fontsize=8,
+                        framealpha=0.7)
+        try:
+            leg.set_draggable(True)
+        except Exception:
+            pass
         ax.grid(axis="x", alpha=0.2, linestyle=":")
 
         self._decomp_fig.tight_layout()

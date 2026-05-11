@@ -2,6 +2,7 @@
 # Build with:  python -m PyInstaller simur.spec
 
 import sys
+from PyInstaller.utils.hooks import collect_data_files
 
 block_cipher = None
 
@@ -11,6 +12,7 @@ a = Analysis(
     binaries=[],
     datas=[
         ('Simur.png', '.'),
+        *collect_data_files('tkinterdnd2'),
     ],
     hiddenimports=[
         'matplotlib.backends.backend_tkagg',
@@ -25,6 +27,7 @@ a = Analysis(
         'tkinter.ttk',
         'tkinter.filedialog',
         'tkinter.messagebox',
+        'tkinterdnd2',
     ],
     hookspath=[],
     hooksconfig={},

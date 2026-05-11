@@ -57,8 +57,9 @@ from pathlib import Path
 import numpy as np
 
 from structure_converter import (
-    XYZStructure, parse_xyz_file, crop_structure_around_absorber,
-    _ATOMIC_NUMBERS,
+    XYZStructure, parse_structure_file, crop_structure_around_absorber,
+    keep_connected_fragment_around_absorber, structure_to_xyz_text,
+    build_cleaned_cif_text, _ATOMIC_NUMBERS,
 )
 
 
@@ -352,6 +353,7 @@ def export_xyz_as_fdmnes_bundle(
     absorber_index: int,
     cluster_radius: float | None = None,
     basename: str = "",
+    remove_disconnected: bool = False,
     **build_kwargs,
 ) -> dict:
     """Write an FDMNES input bundle from an XYZ file.
@@ -374,11 +376,17 @@ def export_xyz_as_fdmnes_bundle(
     ``<output_basename>.txt`` and (if Convolution is on) ``..._conv.txt``
     next to the input.
     """
-    full_structure = parse_xyz_file(xyz_path)
+    full_structure = parse_structure_file(xyz_path)
     target = int(absorber_index)
     if target < 1 or target > full_structure.atom_count:
         raise ValueError(
             f"Absorber index must be 1..{full_structure.atom_count} for this XYZ."
+        )
+
+    solvent_removed = 0
+    if remove_disconnected:
+        full_structure, target, solvent_removed = keep_connected_fragment_around_absorber(
+            full_structure, target
         )
 
     dropped_count = 0
@@ -399,19 +407,21 @@ def export_xyz_as_fdmnes_bundle(
         radius_tag = f"{float(cluster_radius):.1f}A"
         output_basename = f"{safe_base}_{radius_tag}"
         xyz_copy_path = work_dir_path / f"{output_basename}.xyz"
+        cleaned_cif_path = work_dir_path / f"{output_basename}_cleaned.cif"
     else:
         output_basename = safe_base
         xyz_copy_path = work_dir_path / f"{safe_base}.xyz"
+        cleaned_cif_path = work_dir_path / f"{safe_base}_cleaned.cif"
 
     input_path = work_dir_path / "fdmnes_in.txt"
     fdmfile_path = work_dir_path / "fdmfile.txt"
 
     # Write a (possibly cropped) XYZ copy alongside the input.
     if cluster_radius is not None and float(cluster_radius) > 0:
-        xyz_lines = [str(structure.atom_count), structure.title or ""]
-        for sym, xyz in zip(structure.symbols, structure.coords):
-            xyz_lines.append(f"{sym}  {xyz[0]:.6f}  {xyz[1]:.6f}  {xyz[2]:.6f}")
-        xyz_copy_path.write_text("\n".join(xyz_lines) + "\n", encoding="utf-8")
+        xyz_copy_path.write_text(structure_to_xyz_text(structure), encoding="utf-8")
+    elif Path(xyz_path).suffix.lower() == ".cif":
+        xyz_copy_path.write_text(structure_to_xyz_text(structure), encoding="utf-8")
+        cleaned_cif_path.write_text(build_cleaned_cif_text(full_structure), encoding="utf-8")
     else:
         xyz_copy_path.write_text(
             Path(xyz_path).read_text(encoding="utf-8", errors="replace"),
@@ -439,12 +449,19 @@ def export_xyz_as_fdmnes_bundle(
         "input_path":        str(input_path),
         "fdmfile_path":      str(fdmfile_path),
         "xyz_copy_path":     str(xyz_copy_path),
+        "cleaned_cif_path":  (str(cleaned_cif_path)
+                              if Path(xyz_path).suffix.lower() == ".cif" else ""),
         "output_basename":   output_basename,
         "cluster_radius":    (float(cluster_radius)
                               if cluster_radius is not None else None),
         "atoms_dropped":     int(dropped_count),
         "atoms_total_input": int(full_structure.atom_count),
         "atoms_used":        int(structure.atom_count),
+        "solvent_removed_atoms": int(solvent_removed),
+        "cif_cleaning":      {
+            k: v for k, v in dict(full_structure.metadata or {}).items()
+            if k != "cleaned_cif_text"
+        },
     }
 
 

@@ -194,6 +194,7 @@ class ExperimentalParser:
         energy_col = self._find_col(col_map, ["energy", "eV"], required=True)
         i0_col     = self._find_col(col_map, ["I0", "I0Detector"])
         i1_col     = self._find_col(col_map, ["I1", "I1Detector"])
+        i2_col     = self._find_col(col_map, self._I2_COLS)
         inb_col    = self._find_col(col_map, ["InB_DarkCorrect", "NiKa1_InB"])
         outb_col   = self._find_col(col_map, ["OutB_DarkCorrect", "NiKa1_OutB"])
 
@@ -256,6 +257,21 @@ class ExperimentalParser:
         sort_idx = np.argsort(energy)
         energy   = energy[sort_idx]
         raw_mu   = raw_mu[sort_idx]
+        ref_mu = None
+        ref_label = ""
+        if i0_col and i2_col:
+            i0_ref = col(i0_col)[sort_idx]
+            i2_ref = col(i2_col)[sort_idx]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                ratio = np.where((i0_ref > 0) & (i2_ref > 0), i0_ref / i2_ref, np.nan)
+                ref_mu = np.where(np.isfinite(ratio) & (ratio > 0), np.log(ratio), np.nan)
+            mask = np.isfinite(ref_mu)
+            if mask.sum() < 4:
+                ref_mu = None
+            else:
+                fill = float(np.nanmedian(ref_mu[mask]))
+                ref_mu = np.where(np.isfinite(ref_mu), ref_mu, fill)
+                ref_label = col_map.get(i2_col, "I2")
 
         # ── Find E0 (max of first derivative) ─────────────────────────────────
         e0 = self._find_e0(energy, raw_mu)
@@ -280,6 +296,9 @@ class ExperimentalParser:
             scan_type=scan_type,
             metadata={"mode": mode, "element": element, "edge": edge,
                       "col_map": col_map},
+            ref_energy_ev=energy.copy() if ref_mu is not None else None,
+            ref_mu=ref_mu.copy() if ref_mu is not None else None,
+            ref_label=ref_label,
         )
 
     # ── Generic CSV / two-column text ─────────────────────────────────────────

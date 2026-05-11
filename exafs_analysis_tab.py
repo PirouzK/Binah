@@ -27,7 +27,7 @@ from experimental_parser import ExperimentalScan
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.gridspec import GridSpec
-from structure_converter import export_xyz_as_feff_bundle, parse_xyz_file
+from structure_converter import export_xyz_as_feff_bundle, parse_structure_file
 
 matplotlib.use("TkAgg")
 
@@ -88,7 +88,7 @@ def _resolve_absorber_index(text, structure) -> tuple[int, str]:
     an element symbol has no match in the structure.
     """
     if structure is None:
-        raise ValueError("Load an XYZ structure first.")
+        raise ValueError("Load an XYZ or CIF structure first.")
 
     raw = "" if text is None else str(text).strip()
     n = int(structure.atom_count)
@@ -739,15 +739,16 @@ class EXAFSAnalysisTab(tk.Frame):
         self._feff_dir_var = tk.StringVar(value="")
         self._feff_exe_var = tk.StringVar(value="")
         self._feff_info_var = tk.StringVar(value="No FEFF directory selected.")
+        self._xyz_format_var = tk.StringVar(value="XYZ")
         self._xyz_path_var = tk.StringVar(value="")
         self._bundle_base_var = tk.StringVar(value="")
         self._xyz_info_var = tk.StringVar(
-            value="No XYZ structure loaded. CIF export uses a boxed P1 cell."
+            value="No XYZ/CIF structure loaded."
         )
         self._xyz_padding_var = tk.DoubleVar(value=6.0)
         self._xyz_cubic_var = tk.BooleanVar(value=False)
         # Accepts either a 1-based atom index ("5") or an element symbol
-        # ("Ni") that gets resolved against the loaded XYZ.
+        # ("Ni") that gets resolved against the loaded structure.
         self._xyz_absorber_var = tk.StringVar(value="Ni")
         self._xyz_edge_var = tk.StringVar(value="K")
         self._xyz_spectrum_var = tk.StringVar(value="EXAFS")
@@ -756,6 +757,8 @@ class EXAFSAnalysisTab(tk.Frame):
         # card. Drastically faster for isolated molecules and almost always the
         # right choice for XYZ-derived inputs.
         self._xyz_molecular_mode_var = tk.BooleanVar(value=True)
+        self._xyz_use_cluster_var = tk.BooleanVar(value=False)
+        self._xyz_remove_solvent_var = tk.BooleanVar(value=True)
         # Cluster radius (Å): empty = include all atoms; >0 = crop to a sphere
         # around the absorber and tag the output filenames with the radius.
         self._xyz_cluster_radius_var = tk.StringVar(value="")
@@ -821,19 +824,29 @@ class EXAFSAnalysisTab(tk.Frame):
                                               sticky="w")
         top.columnconfigure(1, weight=1)
 
-        xyz_box = tk.LabelFrame(parent, text="XYZ -> FEFF Bundle", padx=5, pady=4)
+        xyz_box = tk.LabelFrame(parent, text="XYZ/CIF -> FEFF Bundle", padx=5, pady=4)
         xyz_box.pack(side=tk.TOP, fill=tk.X, padx=1, pady=(4, 0))
 
-        tk.Label(xyz_box, text="XYZ file:", font=("", 8, "bold")).grid(
+        tk.Label(xyz_box, text="Format:", font=("", 8, "bold")).grid(
             row=0, column=0, sticky="w"
         )
+        ttk.Combobox(
+            xyz_box,
+            textvariable=self._xyz_format_var,
+            values=("XYZ", "CIF"),
+            state="readonly",
+            width=6,
+        ).grid(row=0, column=1, sticky="w", padx=4)
+        tk.Label(xyz_box, text="Structure file:", font=("", 8, "bold")).grid(
+            row=0, column=2, sticky="e"
+        )
         ttk.Entry(xyz_box, textvariable=self._xyz_path_var, width=52).grid(
-            row=0, column=1, columnspan=3, sticky="ew", padx=4
+            row=0, column=3, columnspan=2, sticky="ew", padx=4
         )
         tk.Button(xyz_box, text="Browse", font=("", 8),
-                  command=self._browse_xyz_file).grid(row=0, column=4, padx=2)
-        tk.Button(xyz_box, text="Load XYZ", font=("", 8),
-                  command=self._load_xyz_structure).grid(row=0, column=5, padx=2)
+                  command=self._browse_xyz_file).grid(row=0, column=5, padx=2)
+        tk.Button(xyz_box, text="Load Structure", font=("", 8),
+                  command=self._load_xyz_structure).grid(row=0, column=6, padx=2)
 
         tk.Label(xyz_box, text="Base:", font=("", 8, "bold")).grid(
             row=1, column=0, sticky="w", pady=(4, 0)
@@ -887,26 +900,36 @@ class EXAFSAnalysisTab(tk.Frame):
             variable=self._xyz_molecular_mode_var,
         ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(4, 0))
 
-        tk.Label(xyz_box, text="Cluster (Å):", font=("", 8)).grid(
-            row=3, column=3, sticky="e", pady=(4, 0)
-        )
-        ttk.Entry(xyz_box, textvariable=self._xyz_cluster_radius_var, width=6).grid(
-            row=3, column=4, sticky="w", padx=4, pady=(4, 0)
-        )
-        tk.Label(xyz_box, text="KMESH:", font=("", 8)).grid(
+        ttk.Checkbutton(
+            xyz_box,
+            text="Use cluster radius",
+            variable=self._xyz_use_cluster_var,
+        ).grid(row=3, column=3, columnspan=2, sticky="w", pady=(4, 0))
+        tk.Label(xyz_box, text="Radius (Å):", font=("", 8)).grid(
             row=3, column=5, sticky="e", pady=(4, 0)
         )
-        ttk.Entry(xyz_box, textvariable=self._xyz_kmesh_var, width=6).grid(
+        ttk.Entry(xyz_box, textvariable=self._xyz_cluster_radius_var, width=6).grid(
             row=3, column=6, sticky="w", padx=4, pady=(4, 0)
         )
-        tk.Label(xyz_box, text="Equivalence:", font=("", 8)).grid(
+        ttk.Checkbutton(
+            xyz_box,
+            text="Remove solvent",
+            variable=self._xyz_remove_solvent_var,
+        ).grid(row=4, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        tk.Label(xyz_box, text="KMESH:", font=("", 8)).grid(
             row=3, column=7, sticky="e", pady=(4, 0)
         )
-        ttk.Entry(xyz_box, textvariable=self._xyz_equiv_var, width=6).grid(
+        ttk.Entry(xyz_box, textvariable=self._xyz_kmesh_var, width=6).grid(
             row=3, column=8, sticky="w", padx=4, pady=(4, 0)
         )
+        tk.Label(xyz_box, text="Equivalence:", font=("", 8)).grid(
+            row=3, column=9, sticky="e", pady=(4, 0)
+        )
+        ttk.Entry(xyz_box, textvariable=self._xyz_equiv_var, width=6).grid(
+            row=3, column=10, sticky="w", padx=4, pady=(4, 0)
+        )
         btn_frame = tk.Frame(xyz_box)
-        btn_frame.grid(row=3, column=9, columnspan=2, sticky="ew", padx=(8, 0), pady=(4, 0))
+        btn_frame.grid(row=3, column=11, columnspan=2, sticky="ew", padx=(8, 0), pady=(4, 0))
         tk.Button(
             btn_frame, text="FEFF Options...", font=("", 8),
             command=self._open_feff_options,
@@ -949,8 +972,8 @@ class EXAFSAnalysisTab(tk.Frame):
             font=("", 8),
             justify="left",
         ).grid(row=5, column=0, columnspan=6, sticky="w", pady=(6, 0))
-        xyz_box.columnconfigure(1, weight=1)
-        xyz_box.columnconfigure(3, weight=0)
+        xyz_box.columnconfigure(3, weight=1)
+        xyz_box.columnconfigure(1, weight=0)
 
         # Vertical paned window: body (paths + preview) on top, log on bottom.
         # The sash between them is user-draggable so the log area can be
@@ -1058,6 +1081,7 @@ class EXAFSAnalysisTab(tk.Frame):
 
             _str(self._feff_dir_var,        "feff_dir")
             _str(self._feff_exe_var,         "feff_exe")
+            _str(self._xyz_format_var,       "xyz_format")
             _str(self._xyz_path_var,         "xyz_path")
             _str(self._bundle_base_var,      "bundle_base")
             _str(self._xyz_edge_var,         "xyz_edge")
@@ -1073,6 +1097,16 @@ class EXAFSAnalysisTab(tk.Frame):
             if "xyz_molecular_mode" in saved:
                 try:
                     self._xyz_molecular_mode_var.set(bool(saved["xyz_molecular_mode"]))
+                except Exception:
+                    pass
+            if "xyz_use_cluster" in saved:
+                try:
+                    self._xyz_use_cluster_var.set(bool(saved["xyz_use_cluster"]))
+                except Exception:
+                    pass
+            if "xyz_remove_solvent" in saved:
+                try:
+                    self._xyz_remove_solvent_var.set(bool(saved["xyz_remove_solvent"]))
                 except Exception:
                     pass
             if "xyz_cluster_radius" in saved:
@@ -1107,6 +1141,7 @@ class EXAFSAnalysisTab(tk.Frame):
         feff_tab_data = {
             "feff_dir":         _safe(self._feff_dir_var),
             "feff_exe":         _safe(self._feff_exe_var),
+            "xyz_format":       _safe(self._xyz_format_var),
             "xyz_path":         _safe(self._xyz_path_var),
             "bundle_base":      _safe(self._bundle_base_var),
             "xyz_edge":         _safe(self._xyz_edge_var),
@@ -1120,6 +1155,8 @@ class EXAFSAnalysisTab(tk.Frame):
             "xyz_xanes_emax":   _safe(self._xyz_xanes_emax_var),
             "xyz_xanes_estep":  _safe(self._xyz_xanes_estep_var),
             "xyz_molecular_mode": bool(_safe(self._xyz_molecular_mode_var)),
+            "xyz_use_cluster":   bool(_safe(self._xyz_use_cluster_var)),
+            "xyz_remove_solvent": bool(_safe(self._xyz_remove_solvent_var)),
             "xyz_cluster_radius": str(_safe(self._xyz_cluster_radius_var)),
         }
         try:
@@ -1157,7 +1194,9 @@ class EXAFSAnalysisTab(tk.Frame):
             self._xyz_padding_var, self._xyz_cubic_var,
             self._xyz_absorber_var, self._xyz_kmesh_var, self._xyz_equiv_var,
             self._xyz_xanes_emin_var, self._xyz_xanes_emax_var, self._xyz_xanes_estep_var,
-            self._xyz_molecular_mode_var, self._xyz_cluster_radius_var,
+            self._xyz_molecular_mode_var, self._xyz_use_cluster_var,
+            self._xyz_remove_solvent_var,
+            self._xyz_cluster_radius_var,
         ):
             var.trace_add("write", self._schedule_feff_save)
 
@@ -1894,34 +1933,47 @@ class EXAFSAnalysisTab(tk.Frame):
                   font=("", 8)).pack(pady=(0, 8))
 
     def _browse_xyz_file(self):
+        selected_format = self._xyz_format_var.get().strip().upper()
+        filetypes = (
+            [("XYZ structure files", "*.xyz"), ("CIF structure files", "*.cif"),
+             ("All files", "*.*")]
+            if selected_format == "XYZ" else
+            [("CIF structure files", "*.cif"), ("XYZ structure files", "*.xyz"),
+             ("All files", "*.*")]
+        )
         path = filedialog.askopenfilename(
-            title="Select XYZ Structure",
-            filetypes=[("XYZ files", "*.xyz"), ("All files", "*.*")],
+            title="Select XYZ or CIF Structure",
+            filetypes=filetypes,
         )
         if path:
             self._xyz_path_var.set(path)
+            suffix = Path(path).suffix.lower()
+            if suffix == ".cif":
+                self._xyz_format_var.set("CIF")
+            elif suffix == ".xyz":
+                self._xyz_format_var.set("XYZ")
             self._load_xyz_structure()
 
     def _load_xyz_structure(self, silent: bool = False):
         xyz_path = self._xyz_path_var.get().strip()
         if not xyz_path or not os.path.isfile(xyz_path):
             self._xyz_structure = None
-            self._xyz_info_var.set("No XYZ structure loaded. CIF export uses a boxed P1 cell.")
+            self._xyz_info_var.set("No XYZ/CIF structure loaded.")
             if not silent:
                 messagebox.showwarning(
-                    "XYZ Import",
-                    "Select a valid .xyz structure file first.",
+                    "Structure Import",
+                    "Select a valid .xyz or .cif structure file first.",
                     parent=self,
                 )
             return
 
         try:
-            structure = parse_xyz_file(xyz_path)
+            structure = parse_structure_file(xyz_path)
         except Exception as exc:
             self._xyz_structure = None
-            self._xyz_info_var.set("Could not parse the selected XYZ file.")
+            self._xyz_info_var.set("Could not parse the selected structure file.")
             if not silent:
-                messagebox.showerror("XYZ Import", str(exc), parent=self)
+                messagebox.showerror("Structure Import", str(exc), parent=self)
             return
 
         self._xyz_structure = structure
@@ -1946,9 +1998,14 @@ class EXAFSAnalysisTab(tk.Frame):
         )
         if not silent:
             self._append_feff_log(
-                f"Loaded XYZ structure: {os.path.basename(xyz_path)} "
+                f"Loaded structure: {os.path.basename(xyz_path)} "
                 f"({structure.atom_count} atoms, formula {structure.formula})"
             )
+
+    def _xyz_cluster_radius(self) -> float | None:
+        if not bool(self._xyz_use_cluster_var.get()):
+            return None
+        return _parse_optional_radius(self._xyz_cluster_radius_var.get())
 
     def _write_xyz_feff_bundle(self):
         xyz_path = self._xyz_path_var.get().strip()
@@ -1965,7 +2022,7 @@ class EXAFSAnalysisTab(tk.Frame):
         if self._xyz_structure is None:
             messagebox.showwarning(
                 "FEFF Bundle",
-                "Load a valid XYZ structure first.",
+                "Load a valid XYZ or CIF structure first.",
                 parent=self,
             )
             return
@@ -2050,9 +2107,8 @@ class EXAFSAnalysisTab(tk.Frame):
                 ellipticity=ellip,
                 debye=deb,
                 molecular_mode=bool(self._xyz_molecular_mode_var.get()),
-                cluster_radius=_parse_optional_radius(
-                    self._xyz_cluster_radius_var.get()
-                ),
+                cluster_radius=self._xyz_cluster_radius(),
+                remove_disconnected=bool(self._xyz_remove_solvent_var.get()),
             )
         except Exception as exc:
             messagebox.showerror("FEFF Bundle", str(exc), parent=self)
@@ -2071,6 +2127,21 @@ class EXAFSAnalysisTab(tk.Frame):
             f"Wrote FEFF bundle from {os.path.basename(xyz_path)} into {workdir}"
         )
         self._append_feff_log(f"  CIF: {bundle['cif_path']}")
+        if bundle.get("cleaned_cif_path"):
+            self._append_feff_log(f"  Cleaned CIF: {bundle['cleaned_cif_path']}")
+        cleaning = bundle.get("cif_cleaning") or {}
+        if cleaning.get("cif_atoms_input") is not None:
+            self._append_feff_log(
+                "  CIF cleanup: "
+                f"kept {cleaning.get('cif_atoms_cleaned')} of "
+                f"{cleaning.get('cif_atoms_input')} sites "
+                f"(zero occupancy {cleaning.get('cif_removed_zero_occupancy')}, "
+                f"overlap {cleaning.get('cif_removed_overlap')})"
+            )
+        if bundle.get("solvent_removed_atoms"):
+            self._append_feff_log(
+                f"  Solvent removal: removed {bundle['solvent_removed_atoms']} disconnected atoms"
+            )
         self._append_feff_log(f"  FEFF input: {bundle['feff_inp_path']}")
         if bundle.get("molecular_mode"):
             self._append_feff_log(
@@ -2327,7 +2398,7 @@ class EXAFSAnalysisTab(tk.Frame):
         base = (self._bundle_base_var.get().strip()
                 or (self._xyz_structure.basename if self._xyz_structure else "")
                 or "feff_run")
-        radius = _parse_optional_radius(self._xyz_cluster_radius_var.get())
+        radius = self._xyz_cluster_radius()
         if radius is not None:
             base = f"{base}_{radius:.1f}A"
         return base
@@ -2498,10 +2569,13 @@ class EXAFSAnalysisTab(tk.Frame):
     #  Batch FEFF runs                                                     #
     # ------------------------------------------------------------------ #
     def _on_batch_run_clicked(self):
-        """Pick N .xyz files and queue a sequential FEFF run for each."""
+        """Pick structure files and queue a sequential FEFF run for each."""
         paths = filedialog.askopenfilenames(
-            title="Pick .xyz files for batch FEFF",
-            filetypes=[("XYZ files", "*.xyz"), ("All files", "*.*")],
+            title="Pick .xyz or .cif files for batch FEFF",
+            filetypes=[("XYZ/CIF structure files", "*.xyz *.cif"),
+                       ("XYZ files", "*.xyz"),
+                       ("CIF files", "*.cif"),
+                       ("All files", "*.*")],
             parent=self,
         )
         if not paths:
@@ -2524,20 +2598,20 @@ class EXAFSAnalysisTab(tk.Frame):
             )
             return
 
-        radius = _parse_optional_radius(self._xyz_cluster_radius_var.get())
+        radius = self._xyz_cluster_radius()
         radius_text = f"{radius:.1f} Å" if radius is not None else "(no crop)"
         absorber_spec = self._xyz_absorber_var.get().strip() or "1"
 
         if not messagebox.askyesno(
             "Batch FEFF",
-            f"Run FEFF sequentially on {len(paths)} XYZ file(s)?\n\n"
+            f"Run FEFF sequentially on {len(paths)} XYZ/CIF structure file(s)?\n\n"
             f"  Workdir:   {base_workdir}\n"
             f"  Executable: {os.path.basename(exe)}\n"
             f"  Absorber:   {absorber_spec}\n"
             f"  Cluster:    {radius_text}\n"
             f"  Spectrum:   {self._xyz_spectrum_var.get()}\n"
             f"  Mol. mode:  {bool(self._xyz_molecular_mode_var.get())}\n\n"
-            "Each XYZ goes into its own subdirectory of the workdir.\n"
+            "Each structure goes into its own subdirectory of the workdir.\n"
             "Failed runs are logged and skipped — the batch keeps going.",
             parent=self,
         ):
@@ -2574,11 +2648,12 @@ class EXAFSAnalysisTab(tk.Frame):
                 "multipole_iorder": int(self._xyz_multipole_iorder_var.get()),
                 "molecular_mode":   bool(self._xyz_molecular_mode_var.get()),
                 "cluster_radius":   radius,
+                "remove_disconnected": bool(self._xyz_remove_solvent_var.get()),
             }
         except Exception as exc:
             messagebox.showerror(
                 "Batch FEFF",
-                f"Could not read XYZ-tab settings:\n{exc}\n\n"
+                f"Could not read structure-tab settings:\n{exc}\n\n"
                 "Fix any invalid numeric fields and try again.",
                 parent=self,
             )
@@ -2587,7 +2662,7 @@ class EXAFSAnalysisTab(tk.Frame):
         self._run_feff_btn.config(state=tk.DISABLED)
         self._batch_btn.config(state=tk.DISABLED)
         self._append_feff_log(
-            f"=== Batch FEFF: {len(paths)} XYZ file(s) queued ==="
+            f"=== Batch FEFF: {len(paths)} structure file(s) queued ==="
         )
         threading.Thread(
             target=self._batch_feff_worker,
@@ -2632,9 +2707,9 @@ class EXAFSAnalysisTab(tk.Frame):
                 sub = Path(base_workdir) / folder_name
                 sub.mkdir(parents=True, exist_ok=True)
 
-                # Resolve absorber against THIS XYZ (not the loaded structure
+                # Resolve absorber against THIS structure (not the loaded structure
                 # in the UI) so element-symbol lookups work per-file.
-                structure = parse_xyz_file(xyz_path)
+                structure = parse_structure_file(xyz_path)
                 absorber_idx, absorber_note = _resolve_absorber_index(
                     settings["absorber_spec"], structure
                 )
@@ -2670,6 +2745,7 @@ class EXAFSAnalysisTab(tk.Frame):
                     multipole_iorder=settings["multipole_iorder"],
                     molecular_mode=settings["molecular_mode"],
                     cluster_radius=settings["cluster_radius"],
+                    remove_disconnected=settings.get("remove_disconnected", False),
                 )
                 kept = bundle.get("atoms_used", "?")
                 total = bundle.get("atoms_total_input", "?")
@@ -2811,6 +2887,7 @@ class EXAFSAnalysisTab(tk.Frame):
         # FEFF params (only present when show_feff_panel=True)
         feff_keys = [
             ("feff_dir", "_feff_dir_var"), ("feff_exe", "_feff_exe_var"),
+            ("xyz_format", "_xyz_format_var"),
             ("xyz_path", "_xyz_path_var"),
             ("bundle_base", "_bundle_base_var"),
             ("xyz_padding", "_xyz_padding_var"),
@@ -2831,6 +2908,16 @@ class EXAFSAnalysisTab(tk.Frame):
         if hasattr(self, "_xyz_molecular_mode_var"):
             try:
                 out["xyz_molecular_mode"] = bool(self._xyz_molecular_mode_var.get())
+            except Exception:
+                pass
+        if hasattr(self, "_xyz_use_cluster_var"):
+            try:
+                out["xyz_use_cluster"] = bool(self._xyz_use_cluster_var.get())
+            except Exception:
+                pass
+        if hasattr(self, "_xyz_remove_solvent_var"):
+            try:
+                out["xyz_remove_solvent"] = bool(self._xyz_remove_solvent_var.get())
             except Exception:
                 pass
         if hasattr(self, "_xyz_cluster_radius_var"):
@@ -2903,6 +2990,7 @@ class EXAFSAnalysisTab(tk.Frame):
         # FEFF params (silently skipped when this instance hides FEFF).
         _set_str("_feff_dir_var", "feff_dir")
         _set_str("_feff_exe_var", "feff_exe")
+        _set_str("_xyz_format_var", "xyz_format")
         _set_str("_xyz_path_var", "xyz_path")
         _set_str("_bundle_base_var", "bundle_base")
         _set(_v("_xyz_padding_var"), "xyz_padding")
@@ -2918,6 +3006,8 @@ class EXAFSAnalysisTab(tk.Frame):
         _set(_v("_xyz_xanes_emax_var"), "xyz_xanes_emax")
         _set(_v("_xyz_xanes_estep_var"), "xyz_xanes_estep")
         _set_bool("_xyz_molecular_mode_var", "xyz_molecular_mode")
+        _set_bool("_xyz_use_cluster_var", "xyz_use_cluster")
+        _set_bool("_xyz_remove_solvent_var", "xyz_remove_solvent")
         _set_str("_xyz_cluster_radius_var", "xyz_cluster_radius")
 
         # Auto-load follow-ups, but only if the corresponding panel exists.

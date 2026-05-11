@@ -49,7 +49,7 @@ from exafs_analysis_tab import (
     _resolve_absorber_index,
 )
 from experimental_parser import ExperimentalScan
-from structure_converter import parse_xyz_file
+from structure_converter import parse_structure_file
 
 
 class SimulationStudioTab(tk.Frame):
@@ -69,12 +69,15 @@ class SimulationStudioTab(tk.Frame):
         self._engine_var = tk.StringVar(value="FEFF")
 
         # FDMNES Tk vars (shared structure + FDMNES-specific knobs).
+        self._fd_structure_format_var = tk.StringVar(value="XYZ")
         self._fd_xyz_path_var = tk.StringVar(value="")
         self._fd_workdir_var = tk.StringVar(value="")
         self._fd_basename_var = tk.StringVar(value="")
         self._fd_absorber_var = tk.StringVar(value="Ni")
         self._fd_edge_var = tk.StringVar(value="K")
+        self._fd_use_cluster_var = tk.BooleanVar(value=True)
         self._fd_cluster_radius_var = tk.StringVar(value="6.0")
+        self._fd_remove_solvent_var = tk.BooleanVar(value=True)
         self._fd_emin_var = tk.DoubleVar(value=-10.0)
         self._fd_estep_var = tk.DoubleVar(value=0.1)
         self._fd_emax_var = tk.DoubleVar(value=50.0)
@@ -183,17 +186,26 @@ class SimulationStudioTab(tk.Frame):
                   command=self._browse_fdmnes_workdir).grid(row=0, column=2)
         row.columnconfigure(1, weight=1)
 
-        # XYZ + structure params
+        # Structure input + params
         xyz_box = tk.LabelFrame(parent, text="Structure", padx=6, pady=4)
         xyz_box.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
 
-        tk.Label(xyz_box, text="XYZ file:", font=("", 8, "bold")).grid(
+        tk.Label(xyz_box, text="Format:", font=("", 8, "bold")).grid(
             row=0, column=0, sticky="w")
+        ttk.Combobox(
+            xyz_box,
+            textvariable=self._fd_structure_format_var,
+            values=("XYZ", "CIF"),
+            state="readonly",
+            width=6,
+        ).grid(row=0, column=1, sticky="w", padx=4)
+        tk.Label(xyz_box, text="Structure file:", font=("", 8, "bold")).grid(
+            row=0, column=2, sticky="e")
         ttk.Entry(xyz_box, textvariable=self._fd_xyz_path_var, width=58).grid(
-            row=0, column=1, columnspan=4, sticky="ew", padx=4)
+            row=0, column=3, columnspan=2, sticky="ew", padx=4)
         tk.Button(xyz_box, text="Browse", font=("", 8),
                   command=self._browse_fdmnes_xyz).grid(row=0, column=5)
-        xyz_box.columnconfigure(1, weight=1)
+        xyz_box.columnconfigure(3, weight=1)
 
         tk.Label(xyz_box, text="Base:", font=("", 8, "bold")).grid(
             row=1, column=0, sticky="w", pady=(4, 0))
@@ -210,10 +222,20 @@ class SimulationStudioTab(tk.Frame):
                      state="readonly", width=6).grid(
             row=1, column=5, sticky="w", padx=4, pady=(4, 0))
 
-        tk.Label(xyz_box, text="Cluster (Å):", font=("", 8, "bold")).grid(
-            row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(
+            xyz_box,
+            text="Use cluster radius",
+            variable=self._fd_use_cluster_var,
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        tk.Label(xyz_box, text="Radius (Å):", font=("", 8, "bold")).grid(
+            row=2, column=2, sticky="e", pady=(4, 0))
         ttk.Entry(xyz_box, textvariable=self._fd_cluster_radius_var, width=8).grid(
-            row=2, column=1, sticky="w", padx=4, pady=(4, 0))
+            row=2, column=3, sticky="w", padx=4, pady=(4, 0))
+        ttk.Checkbutton(
+            xyz_box,
+            text="Remove solvent",
+            variable=self._fd_remove_solvent_var,
+        ).grid(row=2, column=4, columnspan=2, sticky="w", pady=(4, 0))
 
         # Energy range
         e_box = tk.LabelFrame(parent, text="Energy range (relative to edge, eV)",
@@ -296,7 +318,7 @@ class SimulationStudioTab(tk.Frame):
 
         b_box = tk.LabelFrame(parent, text="Batch scheduling", padx=6, pady=4)
         b_box.pack(side=tk.TOP, fill=tk.X, pady=(2, 0))
-        tk.Label(b_box, text="Run selected XYZ files:", font=("", 8)).grid(
+        tk.Label(b_box, text="Run selected XYZ/CIF files:", font=("", 8)).grid(
             row=0, column=0, sticky="w")
         ttk.Combobox(
             b_box,
@@ -402,15 +424,33 @@ class SimulationStudioTab(tk.Frame):
             self._fd_workdir_var.set(path)
 
     def _browse_fdmnes_xyz(self):
+        selected_format = self._fd_structure_format_var.get().strip().upper()
+        filetypes = (
+            [("XYZ structure files", "*.xyz"), ("CIF structure files", "*.cif"),
+             ("All files", "*.*")]
+            if selected_format == "XYZ" else
+            [("CIF structure files", "*.cif"), ("XYZ structure files", "*.xyz"),
+             ("All files", "*.*")]
+        )
         path = filedialog.askopenfilename(
             parent=self,
-            title="Pick XYZ file",
-            filetypes=[("XYZ files", "*.xyz"), ("All files", "*.*")],
+            title="Pick XYZ or CIF structure file",
+            filetypes=filetypes,
         )
         if path:
             self._fd_xyz_path_var.set(path)
+            suffix = Path(path).suffix.lower()
+            if suffix == ".cif":
+                self._fd_structure_format_var.set("CIF")
+            elif suffix == ".xyz":
+                self._fd_structure_format_var.set("XYZ")
             if not self._fd_basename_var.get().strip():
                 self._fd_basename_var.set(Path(path).stem)
+
+    def _fd_cluster_radius(self) -> float | None:
+        if not bool(self._fd_use_cluster_var.get()):
+            return None
+        return _parse_optional_radius(self._fd_cluster_radius_var.get())
 
     # ------------------------------------------------------------------ #
     #  Runner spec: chooses between Windows-serial and WSL-parallel       #
@@ -478,7 +518,7 @@ class SimulationStudioTab(tk.Frame):
         xyz_path = self._fd_xyz_path_var.get().strip()
         workdir = self._fd_workdir_var.get().strip()
         if not xyz_path or not os.path.isfile(xyz_path):
-            messagebox.showwarning("FDMNES", "Pick a valid XYZ file first.",
+            messagebox.showwarning("FDMNES", "Pick a valid XYZ or CIF structure file first.",
                                    parent=self)
             return
         if not workdir:
@@ -487,7 +527,7 @@ class SimulationStudioTab(tk.Frame):
             return
 
         try:
-            structure = parse_xyz_file(xyz_path)
+            structure = parse_structure_file(xyz_path)
             absorber_idx, abs_note = _resolve_absorber_index(
                 self._fd_absorber_var.get(), structure
             )
@@ -496,7 +536,7 @@ class SimulationStudioTab(tk.Frame):
             return
         self._append_fd_log(f"Absorber: {abs_note}")
 
-        radius = _parse_optional_radius(self._fd_cluster_radius_var.get())
+        radius = self._fd_cluster_radius()
         base = (self._fd_basename_var.get().strip()
                 or Path(xyz_path).stem)
         safe_base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base).strip("._") or "structure"
@@ -549,6 +589,7 @@ class SimulationStudioTab(tk.Frame):
             "use_allsite":     bool(self._fd_allsite_var.get()),
             "use_cartesian":   bool(self._fd_cartesian_var.get()),
             "use_spherical":   bool(self._fd_spherical_var.get()),
+            "remove_solvent":  bool(self._fd_remove_solvent_var.get()),
         }
 
     def _run_fdmnes_worker(self, spec: dict, xyz_path: str, sub: str,
@@ -572,6 +613,7 @@ class SimulationStudioTab(tk.Frame):
                 absorber_index=absorber_idx,
                 cluster_radius=cluster_radius,
                 basename=safe_base,
+                remove_disconnected=bool(self._fd_remove_solvent_var.get()),
                 edge=settings["edge"],
                 e_min=settings["e_min"],
                 e_step=settings["e_step"],
@@ -596,6 +638,19 @@ class SimulationStudioTab(tk.Frame):
             log(f"  Wrote: {Path(bundle['input_path']).name}, "
                 f"{Path(bundle['fdmfile_path']).name}, "
                 f"{Path(bundle['xyz_copy_path']).name}")
+            if bundle.get("cleaned_cif_path"):
+                log(f"  Cleaned CIF: {Path(bundle['cleaned_cif_path']).name}")
+            cleaning = bundle.get("cif_cleaning") or {}
+            if cleaning.get("cif_atoms_input") is not None:
+                log(
+                    "  CIF cleanup: "
+                    f"kept {cleaning.get('cif_atoms_cleaned')} of "
+                    f"{cleaning.get('cif_atoms_input')} sites "
+                    f"(zero occupancy {cleaning.get('cif_removed_zero_occupancy')}, "
+                    f"overlap {cleaning.get('cif_removed_overlap')})"
+                )
+            if bundle.get("solvent_removed_atoms"):
+                log(f"  Solvent removal: removed {bundle['solvent_removed_atoms']} disconnected atoms")
             log(f"  Atoms: {bundle['atoms_used']} / {bundle['atoms_total_input']}"
                 + (f" (dropped {bundle['atoms_dropped']})"
                    if bundle['atoms_dropped'] else ""))
@@ -648,7 +703,7 @@ class SimulationStudioTab(tk.Frame):
 
             # Convert relative energies to absolute eV using a tabulated edge.
             try:
-                z_abs = self._absorber_z_from_xyz(xyz_path, absorber_idx)
+                z_abs = self._absorber_z_from_structure(xyz_path, absorber_idx)
             except Exception:
                 z_abs = 0
             e0 = edge_energy_eV(z_abs, settings["edge"]) if z_abs else 0.0
@@ -659,6 +714,7 @@ class SimulationStudioTab(tk.Frame):
             )
             if not self._fdmnes_output_covers_range(scan, settings):
                 log("  Output is incomplete; not loading partial spectrum.")
+                log(f"  {self._fdmnes_output_range_note(scan, settings)}")
                 return
             push_scan(scan)
             log(f"  Pushed to plot as: {scan.label}")
@@ -676,9 +732,9 @@ class SimulationStudioTab(tk.Frame):
             pass
 
     @staticmethod
-    def _absorber_z_from_xyz(xyz_path: str, absorber_index: int) -> int:
+    def _absorber_z_from_structure(structure_path: str, absorber_index: int) -> int:
         from structure_converter import _ATOMIC_NUMBERS
-        s = parse_xyz_file(xyz_path)
+        s = parse_structure_file(structure_path)
         sym = s.symbols[absorber_index - 1]
         return int(_ATOMIC_NUMBERS.get(sym, 0))
 
@@ -717,6 +773,19 @@ class SimulationStudioTab(tk.Frame):
         return (
             float(np.nanmin(rel_energy)) <= requested_min + tolerance_eV
             and float(np.nanmax(rel_energy)) >= requested_max - tolerance_eV
+        )
+
+    @staticmethod
+    def _fdmnes_output_range_note(scan: ExperimentalScan, settings: dict) -> str:
+        if scan is None or scan.energy_ev is None or len(scan.energy_ev) == 0:
+            return "Output contains no readable energy points."
+        rel_energy = np.asarray(scan.energy_ev, dtype=float) - float(scan.e0 or 0.0)
+        return (
+            f"Requested {float(settings['e_min']):.1f} to "
+            f"{float(settings['e_max']):.1f} eV; output contains "
+            f"{float(np.nanmin(rel_energy)):.1f} to "
+            f"{float(np.nanmax(rel_energy)):.1f} eV "
+            f"({len(rel_energy)} points)."
         )
 
     @staticmethod
@@ -784,8 +853,11 @@ class SimulationStudioTab(tk.Frame):
             return
 
         paths = filedialog.askopenfilenames(
-            title="Pick .xyz files for batch FDMNES",
-            filetypes=[("XYZ files", "*.xyz"), ("All files", "*.*")],
+            title="Pick .xyz or .cif files for batch FDMNES",
+            filetypes=[("XYZ/CIF structure files", "*.xyz *.cif"),
+                       ("XYZ files", "*.xyz"),
+                       ("CIF files", "*.cif"),
+                       ("All files", "*.*")],
             parent=self,
         )
         if not paths:
@@ -807,22 +879,22 @@ class SimulationStudioTab(tk.Frame):
 
         folder = filedialog.askdirectory(
             parent=self,
-            title="Pick folder containing XYZ files",
+            title="Pick folder containing XYZ/CIF structure files",
         )
         if not folder:
             return
 
         root = Path(folder)
-        pattern = "**/*.xyz" if self._fd_batch_recursive_var.get() else "*.xyz"
+        glob_pattern = "**/*" if self._fd_batch_recursive_var.get() else "*"
         paths = sorted(
-            str(p) for p in root.glob(pattern)
-            if p.is_file() and p.suffix.lower() == ".xyz"
+            str(p) for p in root.glob(glob_pattern)
+            if p.is_file() and p.suffix.lower() in (".xyz", ".cif")
         )
         if not paths:
             mode = " recursively" if self._fd_batch_recursive_var.get() else ""
             messagebox.showinfo(
                 "Batch FDMNES Folder",
-                f"No .xyz files found{mode} in:\n{folder}",
+                f"No .xyz or .cif files found{mode} in:\n{folder}",
                 parent=self,
             )
             return
@@ -840,7 +912,7 @@ class SimulationStudioTab(tk.Frame):
                                  f"Could not read FDMNES settings:\n{exc}",
                                  parent=self)
             return
-        radius = _parse_optional_radius(self._fd_cluster_radius_var.get())
+        radius = self._fd_cluster_radius()
         absorber_spec = self._fd_absorber_var.get().strip() or "1"
         batch_mode = self._fd_batch_mode_var.get().strip() or "Linear"
         try:
@@ -858,7 +930,7 @@ class SimulationStudioTab(tk.Frame):
                       "  Schedule:   linear (one FDMNES job at a time)")
         if not messagebox.askyesno(
             "Batch FDMNES",
-            f"Run FDMNES on {len(paths)} XYZ file(s)?\n\n"
+            f"Run FDMNES on {len(paths)} XYZ/CIF structure file(s)?\n\n"
             f"  Workdir:   {workdir}\n"
             f"  Absorber:   {absorber_spec}\n"
             f"  Cluster:    {f'{radius:.1f} Å' if radius else '(no crop)'}\n"
@@ -867,7 +939,7 @@ class SimulationStudioTab(tk.Frame):
             f"(step {settings['e_step']})\n"
             f"{mode_line}\n"
             f"{sched_line}\n\n"
-            "Each XYZ gets its own input folder under the workdir before runs start.\n"
+            "Each structure gets its own input folder under the workdir before runs start.\n"
             "Failed runs are logged and skipped — the batch keeps going.",
             parent=self,
         ):
@@ -877,7 +949,7 @@ class SimulationStudioTab(tk.Frame):
         self._fdmnes_batch_btn.config(state=tk.DISABLED)
         self._fdmnes_batch_folder_btn.config(state=tk.DISABLED)
         self._append_fd_log("")
-        self._append_fd_log(f"=== Batch FDMNES: {len(paths)} XYZ file(s) queued ===")
+        self._append_fd_log(f"=== Batch FDMNES: {len(paths)} structure file(s) queued ===")
         self._append_fd_log(f"Source: {source_label}")
         self._append_fd_log(mode_line.lstrip())
         self._append_fd_log(sched_line.lstrip())
@@ -914,7 +986,7 @@ class SimulationStudioTab(tk.Frame):
                 sub = Path(base_workdir) / folder
                 sub.mkdir(parents=True, exist_ok=True)
 
-                structure = parse_xyz_file(xyz_path)
+                structure = parse_structure_file(xyz_path)
                 absorber_idx, abs_note = _resolve_absorber_index(
                     absorber_spec, structure
                 )
@@ -990,7 +1062,7 @@ class SimulationStudioTab(tk.Frame):
                     failed.append(xyz_name)
                     continue
 
-                z_abs = self._absorber_z_from_xyz(xyz_path, absorber_idx)
+                z_abs = self._absorber_z_from_structure(xyz_path, absorber_idx)
                 e0 = edge_energy_eV(z_abs, settings["edge"]) if z_abs else 0.0
                 scan = self._scan_from_fdmnes_output(
                     output_file, label=out_basename, e0=e0,
@@ -1032,6 +1104,7 @@ class SimulationStudioTab(tk.Frame):
             "use_allsite": settings["use_allsite"],
             "use_cartesian": settings["use_cartesian"],
             "use_spherical": settings["use_spherical"],
+            "remove_disconnected": bool(settings.get("remove_solvent", False)),
         }
 
     def _execute_prepared_fdmnes_task(self, task: dict, spec: dict,
@@ -1076,7 +1149,7 @@ class SimulationStudioTab(tk.Frame):
                 )
                 return {"ok": False, "xyz_name": xyz_name, "logs": logs}
 
-            z_abs = self._absorber_z_from_xyz(
+            z_abs = self._absorber_z_from_structure(
                 task["xyz_path"], task["absorber_idx"]
             )
             e0 = edge_energy_eV(z_abs, settings["edge"]) if z_abs else 0.0
@@ -1085,6 +1158,7 @@ class SimulationStudioTab(tk.Frame):
             )
             if not self._fdmnes_output_covers_range(scan, settings):
                 logs.append("  Output is incomplete; not loading partial spectrum.")
+                logs.append(f"  {self._fdmnes_output_range_note(scan, settings)}")
                 return {"ok": False, "xyz_name": xyz_name, "logs": logs}
             logs.append(f"  Pushed to plot: {scan.label}")
             return {
@@ -1134,7 +1208,7 @@ class SimulationStudioTab(tk.Frame):
                 sub = Path(base_workdir) / folder
                 sub.mkdir(parents=True, exist_ok=True)
 
-                structure = parse_xyz_file(xyz_path)
+                structure = parse_structure_file(xyz_path)
                 absorber_idx, abs_note = _resolve_absorber_index(
                     absorber_spec, structure
                 )
@@ -1150,6 +1224,19 @@ class SimulationStudioTab(tk.Frame):
                 log(f"  Wrote: {Path(bundle['input_path']).name}, "
                     f"{Path(bundle['fdmfile_path']).name}, "
                     f"{Path(bundle['xyz_copy_path']).name}")
+                if bundle.get("cleaned_cif_path"):
+                    log(f"  Cleaned CIF: {Path(bundle['cleaned_cif_path']).name}")
+                cleaning = bundle.get("cif_cleaning") or {}
+                if cleaning.get("cif_atoms_input") is not None:
+                    log(
+                        "  CIF cleanup: "
+                        f"kept {cleaning.get('cif_atoms_cleaned')} of "
+                        f"{cleaning.get('cif_atoms_input')} sites "
+                        f"(zero occupancy {cleaning.get('cif_removed_zero_occupancy')}, "
+                        f"overlap {cleaning.get('cif_removed_overlap')})"
+                    )
+                if bundle.get("solvent_removed_atoms"):
+                    log(f"  Solvent removal: removed {bundle['solvent_removed_atoms']} disconnected atoms")
                 tasks.append({
                     "idx": idx,
                     "n": n,
@@ -1244,12 +1331,15 @@ class SimulationStudioTab(tk.Frame):
             "engine":         self._engine_var.get(),
             "feff":           feff_params,
             "fdmnes": {
+                "structure_format": self._fd_structure_format_var.get(),
                 "xyz_path":        self._fd_xyz_path_var.get(),
                 "workdir":         self._fd_workdir_var.get(),
                 "basename":        self._fd_basename_var.get(),
                 "absorber":        self._fd_absorber_var.get(),
                 "edge":            self._fd_edge_var.get(),
+                "use_cluster":      bool(self._fd_use_cluster_var.get()),
                 "cluster_radius":  self._fd_cluster_radius_var.get(),
+                "remove_solvent":   bool(self._fd_remove_solvent_var.get()),
                 "e_min":           float(self._fd_emin_var.get()),
                 "e_step":          float(self._fd_estep_var.get()),
                 "e_max":           float(self._fd_emax_var.get()),
@@ -1307,6 +1397,10 @@ class SimulationStudioTab(tk.Frame):
 
         # FDMNES half.
         fd = data.get("fdmnes") or {}
+        if "structure_format" in fd:
+            fmt = str(fd["structure_format"]).strip().upper()
+            if fmt in ("XYZ", "CIF"):
+                self._fd_structure_format_var.set(fmt)
         if "xyz_path" in fd:
             self._fd_xyz_path_var.set(str(fd["xyz_path"]))
         if "workdir" in fd:
@@ -1317,8 +1411,18 @@ class SimulationStudioTab(tk.Frame):
             self._fd_absorber_var.set(str(fd["absorber"]))
         if "edge" in fd:
             self._fd_edge_var.set(str(fd["edge"]))
+        if "use_cluster" in fd:
+            try:
+                self._fd_use_cluster_var.set(bool(fd["use_cluster"]))
+            except Exception:
+                pass
         if "cluster_radius" in fd:
             self._fd_cluster_radius_var.set(str(fd["cluster_radius"]))
+        if "remove_solvent" in fd:
+            try:
+                self._fd_remove_solvent_var.set(bool(fd["remove_solvent"]))
+            except Exception:
+                pass
         for var, key in [(self._fd_emin_var, "e_min"),
                          (self._fd_estep_var, "e_step"),
                          (self._fd_emax_var, "e_max"),

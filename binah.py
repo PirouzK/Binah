@@ -8,6 +8,10 @@ import os
 import queue
 import sys
 import threading
+from typing import Optional
+import numpy as np
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 try:
     import tkinter as tk
@@ -27,6 +31,14 @@ except ImportError:
     sys.exit(1)
 
 from tkinter import ttk, filedialog, messagebox, simpledialog
+
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _HAS_TKDND = True
+except Exception:
+    TkinterDnD = None
+    DND_FILES = None
+    _HAS_TKDND = False
 
 try:
     from sgm_xas_loader import SGMLoaderApp as _SGMLoaderApp
@@ -59,7 +71,7 @@ def _set_window_icon(win: tk.Tk, png_name: str) -> None:
         pass
 
 
-class OrcaTDDFTApp(tk.Tk):
+class OrcaTDDFTApp((TkinterDnD.Tk if _HAS_TKDND else tk.Tk)):
     def __init__(self):
         super().__init__()
         self.title("Binah")
@@ -83,6 +95,7 @@ class OrcaTDDFTApp(tk.Tk):
         self._build_top_bar()
         self._build_main_area()
         self._build_status_bar()
+        self._setup_drag_and_drop()
         self.after(900, self._maybe_prompt_feff_setup)
 
     # ------------------------------------------------------------------ #
@@ -299,6 +312,83 @@ class OrcaTDDFTApp(tk.Tk):
         bar = tk.Label(self, textvariable=self._status, bd=1, relief=tk.SUNKEN,
                        anchor="w", padx=6, font=("", 8))
         bar.pack(side=tk.BOTTOM, fill=tk.X)
+
+    def _setup_drag_and_drop(self):
+        if not _HAS_TKDND:
+            return
+        try:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_files_dropped)
+            self._status.set(
+                "Ready. Drag ORCA .out, experimental data, projects, or folders onto Binah."
+            )
+        except Exception:
+            pass
+
+    def _drop_paths_from_event(self, event) -> list[str]:
+        try:
+            raw_paths = self.tk.splitlist(event.data)
+        except Exception:
+            raw_paths = str(getattr(event, "data", "")).split()
+        return [os.fspath(p) for p in raw_paths if os.fspath(p).strip()]
+
+    def _expand_dropped_paths(self, paths: list[str]) -> list[str]:
+        expanded = []
+        for path in paths:
+            if os.path.isdir(path):
+                for root, _dirs, files in os.walk(path):
+                    for name in files:
+                        ext = os.path.splitext(name)[1].lower()
+                        if ext in {".out", ".dat", ".prj", ".nor", ".csv", ".txt", ".otproj"}:
+                            expanded.append(os.path.join(root, name))
+            else:
+                expanded.append(path)
+        return expanded
+
+    def _on_files_dropped(self, event):
+        paths = self._expand_dropped_paths(self._drop_paths_from_event(event))
+        if not paths:
+            return
+
+        orca_paths = []
+        exp_paths = []
+        project_paths = []
+        skipped = []
+        for path in paths:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".out":
+                orca_paths.append(path)
+            elif ext in {".dat", ".prj", ".nor", ".csv", ".txt"}:
+                exp_paths.append(path)
+            elif ext == ".otproj":
+                project_paths.append(path)
+            else:
+                skipped.append(os.path.basename(path))
+
+        for path in project_paths:
+            self._open_recent_project(path)
+        for path in orca_paths:
+            self._load_file(path, switch=False)
+        if orca_paths:
+            self._file_listbox.selection_clear(0, tk.END)
+            self._file_listbox.selection_set(tk.END)
+            self._on_file_select()
+        n_exp = self._load_experimental_paths(exp_paths) if exp_paths else 0
+
+        msg = (
+            f"Dropped: {len(orca_paths)} ORCA file(s), "
+            f"{n_exp} experimental scan(s), {len(project_paths)} project(s)"
+        )
+        if skipped:
+            msg += f" | skipped {len(skipped)}"
+        self._status.set(msg)
+        if skipped:
+            messagebox.showwarning(
+                "Dropped Files",
+                "Some dropped item(s) were not loaded:\n\n" + "\n".join(skipped[:12]) +
+                ("\n..." if len(skipped) > 12 else ""),
+                parent=self,
+            )
 
     def _feff_exe_var(self):
         """Return the FEFF-executable Tk var on whichever tab owns the FEFF
@@ -958,10 +1048,259 @@ class OrcaTDDFTApp(tk.Tk):
     # ------------------------------------------------------------------ #
     #  Experimental data loading                                            #
     # ------------------------------------------------------------------ #
+    def _reference_e0(self, scan: ExperimentalScan, use_ref: bool = True) -> float:
+        if use_ref and scan.has_reference():
+            return self._exp_parser._find_e0(
+                np.asarray(scan.ref_energy_ev, dtype=float),
+                np.asarray(scan.ref_mu, dtype=float),
+            )
+        return self._exp_parser._find_e0(
+            np.asarray(scan.energy_ev, dtype=float),
+            np.asarray(scan.mu, dtype=float),
+        )
+
+    def _shift_scan_energy(self, scan: ExperimentalScan, shift: float) -> None:
+        scan.energy_ev = np.asarray(scan.energy_ev, dtype=float) + shift
+        if getattr(scan, "ref_energy_ev", None) is not None:
+            scan.ref_energy_ev = np.asarray(scan.ref_energy_ev, dtype=float) + shift
+        if scan.e0:
+            scan.e0 = float(scan.e0 + shift)
+
+    def _auto_align_i2_references(self, scans: list[ExperimentalScan]) -> int:
+        ref_scans = [scan for scan in scans if scan.has_reference()]
+        if not ref_scans:
+            return 0
+        measurements = []
+        for scan in ref_scans:
+            try:
+                measurements.append((scan, self._reference_e0(scan, use_ref=True)))
+            except Exception:
+                pass
+        if not measurements:
+            return 0
+
+        target_e0 = measurements[0][1]
+        link_group = f"auto-ref-{id(scans)}"
+        aligned = 0
+        for scan, measured_e0 in measurements:
+            shift = target_e0 - measured_e0
+            self._shift_scan_energy(scan, shift)
+            scan.metadata.setdefault("reference_calibration", {})
+            scan.metadata["reference_calibration"].update({
+                "mode": "I2/reference channel",
+                "target_e0_ev": round(target_e0, 6),
+                "measured_ref_e0_ev": round(measured_e0, 6),
+                "shift_ev": round(shift, 6),
+                "reference_label": scan.ref_label or "reference",
+            })
+            scan.metadata["_binah_link_group"] = link_group
+            aligned += 1
+        return aligned
+
+    def _parse_reference_standard_file(self, path: str) -> list[ExperimentalScan]:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".dat":
+            ref = self._exp_parser.extract_reference_scan(path)
+            if ref is not None:
+                ref.metadata["reference_role"] = "external I2/foil standard"
+                return [ref]
+            if self._exp_parser.is_sxrmb(path):
+                scans = self._exp_parser.parse_sxrmb(path, signal="auto")
+            else:
+                scans = [self._exp_parser.parse_dat(path, mode="transmission", normalize=False)]
+        elif ext == ".prj":
+            scans = self._exp_parser.parse_prj(path)
+        elif ext == ".nor":
+            scans = self._exp_parser.parse_nor(path)
+        else:
+            scans = [self._exp_parser.parse_csv(path)]
+        for scan in scans:
+            scan.metadata["reference_role"] = "external standard"
+        return scans
+
+    def _load_reference_standard_scans(self) -> list[ExperimentalScan]:
+        paths = filedialog.askopenfilenames(
+            title="Load Reference / Standard Scan(s)",
+            filetypes=[
+                ("All supported", "*.dat *.prj *.nor *.csv *.txt"),
+                ("Data files", "*.dat *.nor *.csv *.txt"),
+                ("Athena project", "*.prj"),
+                ("All files", "*.*"),
+            ],
+            parent=self,
+        )
+        if not paths:
+            return []
+        standards = []
+        failures = []
+        for path in paths:
+            try:
+                parsed = self._parse_reference_standard_file(path)
+                if not parsed:
+                    raise ValueError("No usable scan found in reference file.")
+                standards.extend(parsed)
+            except Exception as exc:
+                failures.append(f"{os.path.basename(path)}: {exc}")
+        if failures:
+            messagebox.showerror(
+                "Reference Load Error",
+                "Could not load some reference/standard file(s):\n\n" + "\n".join(failures),
+                parent=self,
+            )
+        return standards
+
+    def _calibrate_scans_to_standard(self, scans: list[ExperimentalScan],
+                                     standard: ExperimentalScan,
+                                     extra_standards: Optional[list[ExperimentalScan]] = None) -> bool:
+        try:
+            measured_e0 = self._reference_e0(standard, use_ref=standard.has_reference())
+        except Exception:
+            messagebox.showwarning(
+                "Reference Calibration",
+                "Could not find an edge in the reference/standard scan.",
+                parent=self,
+            )
+            return False
+
+        target_e0 = simpledialog.askfloat(
+            "Reference Calibration",
+            "Target E0 for this reference/standard (eV):",
+            initialvalue=round(measured_e0, 3),
+            parent=self,
+        )
+        if target_e0 is None:
+            return False
+
+        shift = float(target_e0) - measured_e0
+        link_group = f"standard-{id(scans)}"
+        for scan in scans:
+            self._shift_scan_energy(scan, shift)
+            scan.metadata.setdefault("reference_calibration", {})
+            scan.metadata["reference_calibration"].update({
+                "mode": "external standard",
+                "standard_label": standard.label,
+                "target_e0_ev": round(float(target_e0), 6),
+                "measured_standard_e0_ev": round(measured_e0, 6),
+                "shift_ev": round(shift, 6),
+            })
+            scan.metadata["_binah_link_group"] = link_group
+        for std in [standard] + list(extra_standards or []):
+            self._shift_scan_energy(std, shift)
+            std.metadata.setdefault("reference_calibration", {})
+            std.metadata["reference_calibration"].update({
+                "mode": "external standard source",
+                "target_e0_ev": round(float(target_e0), 6),
+                "measured_standard_e0_ev": round(measured_e0, 6),
+                "shift_ev": round(shift, 6),
+            })
+            std.metadata["_binah_link_group"] = link_group
+        return True
+
+    def _postprocess_experimental_batch(self, scans: list[ExperimentalScan],
+                                        prompt_for_reference: bool = True) -> list[ExperimentalScan]:
+        if not scans:
+            return scans
+        aligned = self._auto_align_i2_references(scans)
+        missing_ref = [scan for scan in scans if not scan.has_reference()]
+        should_prompt = prompt_for_reference and (not aligned or missing_ref)
+        if should_prompt:
+            if aligned and missing_ref:
+                msg = (
+                    f"Detected an I2/reference channel for {aligned}/{len(scans)} scan(s), "
+                    "but some scans do not have one.\n\n"
+                    "Load a separate foil/standard scan to calibrate the whole batch?"
+                )
+            else:
+                msg = (
+                    "I could not detect an I2/reference channel in this upload.\n\n"
+                    "Load a separate foil/standard scan to calibrate all of these scans?"
+            )
+            if messagebox.askyesno("Reference / Standard", msg, parent=self):
+                standards = self._load_reference_standard_scans()
+                if standards and self._calibrate_scans_to_standard(
+                    scans, standards[0], extra_standards=standards[1:]
+                ):
+                    for standard in standards:
+                        standard.label = f"{standard.label}  [reference standard]"
+                    scans = scans + standards
+        elif aligned:
+            self._status.set(f"Auto-aligned {aligned} scan(s) using detected reference channels.")
+        return scans
+
+    def _add_experimental_batch(self, scans: list[ExperimentalScan],
+                                prompt_for_reference: bool = True) -> int:
+        scans = self._postprocess_experimental_batch(scans, prompt_for_reference=prompt_for_reference)
+        for scan in scans:
+            self._add_exp_scan_to_plot(scan)
+        return len(scans)
+
+    def _load_experimental_paths(self, paths) -> int:
+        paths = self._as_path_list(paths)
+        dat_paths = []
+        pending_scans = []
+        n_loaded = 0
+        n_failed = 0
+
+        for path in paths:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".dat":
+                dat_paths.append(path)
+                continue
+            try:
+                if ext == ".prj":
+                    before = len(self._plot._exp_scans)
+                    self._load_prj_with_dialog(path)
+                    n_loaded += max(0, len(self._plot._exp_scans) - before)
+                elif ext == ".nor":
+                    scans = self._exp_parser.parse_nor(path)
+                    pending_scans.extend(scans)
+                    self._status.set(
+                        f"Loaded {len(scans)} scan(s) from {os.path.basename(path)}")
+                else:
+                    scan = self._exp_parser.parse_csv(path)
+                    pending_scans.append(scan)
+                    self._status.set(f"Loaded experimental scan: {os.path.basename(path)}")
+            except Exception as e:
+                n_failed += 1
+                messagebox.showerror(
+                    "Load Error",
+                    f"Failed to load experimental file:\n{os.path.basename(path)}\n\n{e}",
+                )
+
+        if pending_scans:
+            n_loaded += self._add_experimental_batch(pending_scans)
+
+        if dat_paths:
+            try:
+                sxrmb_paths = []
+                bioxas_paths = []
+                for path in dat_paths:
+                    if self._exp_parser.is_sxrmb(path):
+                        sxrmb_paths.append(path)
+                    else:
+                        bioxas_paths.append(path)
+                if sxrmb_paths:
+                    sxrmb_win = self._load_sxrmb_with_dialog(sxrmb_paths)
+                    if bioxas_paths:
+                        self.wait_window(sxrmb_win)
+                if bioxas_paths:
+                    self._load_dat_with_dialog(bioxas_paths)
+            except Exception as e:
+                messagebox.showerror("Load Error", f"Failed to inspect .dat file(s):\n{e}")
+                self._status.set("Error loading experimental file.")
+                return
+
+        if n_loaded or n_failed:
+            self._status.set(
+                f"Loaded {n_loaded} experimental scan(s)." +
+                (f"  {n_failed} failed." if n_failed else "")
+            )
+        return n_loaded
+
     def _load_experimental(self):
         """Open a file dialog and load experimental XAS scan(s)."""
-        path = filedialog.askopenfilename(
-            title="Load Experimental XAS Scan",
+        paths = filedialog.askopenfilenames(
+            title="Load Experimental XAS Scan(s)",
             filetypes=[
                 ("All supported", "*.dat *.prj *.nor *.csv *.txt"),
                 ("SXRMB / BioXAS (.dat)", "*.dat"),
@@ -971,35 +1310,155 @@ class OrcaTDDFTApp(tk.Tk):
                 ("All files", "*.*"),
             ]
         )
-        if not path:
+        if paths:
+            self._load_experimental_paths(paths)
+
+    def _as_path_list(self, paths):
+        if isinstance(paths, (str, bytes, os.PathLike)):
+            return [os.fspath(paths)]
+        return [os.fspath(path) for path in paths]
+
+    def _format_batch_name(self, paths):
+        paths = self._as_path_list(paths)
+        if len(paths) == 1:
+            return os.path.basename(paths[0])
+        return f"{len(paths)} files selected"
+
+    def _preview_curve(self, y):
+        arr = np.asarray(y, dtype=float)
+        mask = np.isfinite(arr)
+        if not mask.any():
+            return arr
+        lo = float(np.nanmin(arr[mask]))
+        hi = float(np.nanmax(arr[mask]))
+        arr = arr - lo
+        span = hi - lo
+        if span > 0:
+            arr = arr / span
+        return arr
+
+    def _imported_reference_preview_channels(self, standards: list[ExperimentalScan]) -> list:
+        channels = []
+        for std in standards:
+            if std.has_reference():
+                channels.append((
+                    f"Imported reference: {std.label} ({std.ref_label or 'ref'})",
+                    "reference",
+                    np.asarray(std.ref_energy_ev, dtype=float),
+                    np.asarray(std.ref_mu, dtype=float),
+                ))
+            else:
+                channels.append((
+                    f"Imported reference: {std.label}",
+                    "reference",
+                    np.asarray(std.energy_ev, dtype=float),
+                    np.asarray(std.mu, dtype=float),
+                ))
+        return channels
+
+    def _draw_experimental_preview(self, ax, canvas, channels, enabled_kinds,
+                                   show_reference=False, imported_refs=None):
+        ax.clear()
+        imported_refs = imported_refs or []
+        plotted = 0
+        colours = {
+            "fluorescence": "#8B0000",
+            "transmission": "#003366",
+            "tey": "#00695C",
+            "reference": "#555555",
+        }
+        labels_seen = set()
+        all_channels = list(channels)
+        if show_reference:
+            all_channels.extend(self._imported_reference_preview_channels(imported_refs))
+        for name, kind, energy, signal in all_channels:
+            if kind == "reference":
+                if not show_reference:
+                    continue
+                ls = "--"
+            else:
+                if kind not in enabled_kinds:
+                    continue
+                ls = "-"
+            x = np.asarray(energy, dtype=float)
+            y = self._preview_curve(signal)
+            n = min(len(x), len(y))
+            if n < 2:
+                continue
+            label = name
+            if label in labels_seen:
+                label = f"{label} #{plotted + 1}"
+            labels_seen.add(label)
+            ax.plot(x[:n], y[:n], color=colours.get(kind, "#333333"),
+                    lw=1.5, ls=ls, alpha=0.92, label=label)
+            plotted += 1
+        ax.set_xlabel("Energy (eV)")
+        ax.set_ylabel("Preview intensity (scaled)")
+        ax.grid(True, alpha=0.25, linestyle=":")
+        if plotted:
+            ax.legend(fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "No preview channel selected",
+                    ha="center", va="center", transform=ax.transAxes,
+                    color="gray")
+        canvas.draw_idle()
+
+    def _load_selected_experimental_dat(self, paths, loader_kind: str,
+                                        selected_modes: list[str],
+                                        normalize: bool,
+                                        imported_refs: list[ExperimentalScan],
+                                        win, status_lbl) -> None:
+        if not selected_modes:
+            status_lbl.config(text="Choose at least one signal to import.")
             return
 
-        ext = os.path.splitext(path)[1].lower()
+        loaded_scans = []
+        failures = []
+        for path in paths:
+            for mode in selected_modes:
+                try:
+                    if loader_kind == "sxrmb":
+                        signal = {"tey": "tey", "fluorescence": "fluor"}.get(mode, mode)
+                        loaded_scans.extend(self._exp_parser.parse_sxrmb(path, signal=signal))
+                    else:
+                        loaded_scans.append(self._exp_parser.parse_dat(
+                            path, mode=mode, normalize=normalize))
+                except Exception as exc:
+                    failures.append(f"{os.path.basename(path)} [{mode}]: {exc}")
 
-        try:
-            if ext == ".dat" and self._exp_parser.is_sxrmb(path):
-                self._load_sxrmb_with_dialog(path)
-            elif ext == ".dat":
-                self._load_dat_with_dialog(path)
-            elif ext == ".prj":
-                self._load_prj_with_dialog(path)
-            elif ext == ".nor":
-                scans = self._exp_parser.parse_nor(path)
-                for scan in scans:
-                    self._add_exp_scan_to_plot(scan)
-                self._status.set(
-                    f"Loaded {len(scans)} scan(s) from {os.path.basename(path)}")
-            else:
-                # Generic CSV / two-column text
-                scan = self._exp_parser.parse_csv(path)
-                self._add_exp_scan_to_plot(scan)
-                self._status.set(f"Loaded experimental scan: {os.path.basename(path)}")
-        except Exception as e:
-            messagebox.showerror("Load Error", f"Failed to load experimental file:\n{e}")
-            self._status.set("Error loading experimental file.")
+        if failures and not loaded_scans:
+            status_lbl.config(text=f"Error: {failures[0]}")
+            return
 
-    def _load_sxrmb_with_dialog(self, path: str):
+        prompt_for_reference = not imported_refs
+        scans_to_add = loaded_scans
+        if imported_refs and loaded_scans:
+            if self._calibrate_scans_to_standard(
+                loaded_scans, imported_refs[0], extra_standards=imported_refs[1:]
+            ):
+                for standard in imported_refs:
+                    if "[reference standard]" not in standard.label:
+                        standard.label = f"{standard.label}  [reference standard]"
+                scans_to_add = loaded_scans + imported_refs
+                prompt_for_reference = False
+
+        win.destroy()
+        n_loaded = self._add_experimental_batch(
+            scans_to_add, prompt_for_reference=prompt_for_reference
+        ) if scans_to_add else 0
+        if failures:
+            messagebox.showerror(
+                "Experimental Load Error",
+                "Failed to load some signal(s):\n\n" + "\n".join(failures),
+            )
+        self._status.set(
+            f"Loaded {n_loaded} experimental scan(s)." +
+            (f"  {len(failures)} signal(s) failed." if failures else "")
+        )
+
+    def _load_sxrmb_with_dialog(self, paths):
         """Show signal-selection dialog for SXRMB .dat files, then load."""
+        paths = self._as_path_list(paths)
         win = tk.Toplevel(self)
         win.title("SXRMB Import — Select Signal")
         win.resizable(False, False)
@@ -1009,7 +1468,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="CLS SXRMB Beamline Import",
                  font=("", 11, "bold"), bg="#003366", fg="black").pack(padx=12)
-        tk.Label(hdr, text=os.path.basename(path),
+        tk.Label(hdr, text=self._format_batch_name(paths),
                  font=("", 8), bg="#003366", fg="#AACCFF").pack(padx=12)
 
         body = tk.Frame(win, padx=16, pady=10)
@@ -1039,25 +1498,35 @@ class OrcaTDDFTApp(tk.Tk):
 
         def do_load():
             sig = _signal_var.get()
+            loaded_scans = []
+            failures = []
+            for path in paths:
+                try:
+                    scans = self._exp_parser.parse_sxrmb(path, signal=sig)
+                    loaded_scans.extend(scans)
+                except Exception as e:
+                    failures.append(f"{os.path.basename(path)}: {e}")
             win.destroy()
-            try:
-                scans = self._exp_parser.parse_sxrmb(path, signal=sig)
-                for scan in scans:
-                    self._add_exp_scan_to_plot(scan)
-                self._status.set(
-                    f"Loaded {len(scans)} SXRMB scan(s) from {os.path.basename(path)}")
-            except Exception as e:
-                messagebox.showerror("SXRMB Load Error",
-                                     f"Failed to load SXRMB file:\n{e}")
-                self._status.set("Error loading SXRMB file.")
+            n_loaded = self._add_experimental_batch(loaded_scans) if loaded_scans else 0
+            if failures:
+                messagebox.showerror(
+                    "SXRMB Load Error",
+                    "Failed to load some SXRMB file(s):\n\n" + "\n".join(failures),
+                )
+            self._status.set(
+                f"Loaded {n_loaded} SXRMB scan(s)." +
+                (f"  {len(failures)} file(s) failed." if failures else "")
+            )
 
         tk.Button(btn_row, text="Load", width=12, bg="#003366", fg="black",
                   activebackground="#0055aa", command=do_load).pack(side=tk.LEFT, padx=4)
         tk.Button(btn_row, text="Cancel", width=10,
                   command=win.destroy).pack(side=tk.LEFT, padx=4)
+        return win
 
-    def _load_dat_with_dialog(self, path: str):
+    def _load_dat_with_dialog(self, paths):
         """Show options dialog for BioXAS .dat files, then load."""
+        paths = self._as_path_list(paths)
         win = tk.Toplevel(self)
         win.title("Load .dat — Options")
         win.resizable(False, False)
@@ -1068,7 +1537,7 @@ class OrcaTDDFTApp(tk.Tk):
         hdr.pack(fill=tk.X)
         tk.Label(hdr, text="BioXAS XDI Import Options",
                  bg="#6B0000", fg="black", font=("", 11, "bold")).pack(anchor="w")
-        tk.Label(hdr, text=os.path.basename(path),
+        tk.Label(hdr, text=self._format_batch_name(paths),
                  bg="#6B0000", fg="#ffaaaa", font=("", 9)).pack(anchor="w")
 
         body = tk.Frame(win, padx=16, pady=12)
@@ -1096,19 +1565,32 @@ class OrcaTDDFTApp(tk.Tk):
         status_lbl.pack(anchor="w")
 
         def do_load():
-            try:
-                scan = self._exp_parser.parse_dat(
-                    path,
-                    mode=mode_var.get(),
-                    normalize=norm_var.get(),
+            loaded_scans = []
+            failures = []
+            for path in paths:
+                try:
+                    scan = self._exp_parser.parse_dat(
+                        path,
+                        mode=mode_var.get(),
+                        normalize=norm_var.get(),
+                    )
+                    loaded_scans.append(scan)
+                except Exception as e:
+                    failures.append(f"{os.path.basename(path)}: {e}")
+            if failures and not loaded_scans:
+                status_lbl.config(text=f"Error: {failures[0]}")
+                return
+            win.destroy()
+            n_loaded = self._add_experimental_batch(loaded_scans) if loaded_scans else 0
+            if failures:
+                messagebox.showerror(
+                    "BioXAS Load Error",
+                    "Failed to load some .dat file(s):\n\n" + "\n".join(failures),
                 )
-                win.destroy()
-                self._add_exp_scan_to_plot(scan)
-                self._status.set(
-                    f"Loaded experimental: {scan.label} [{scan.scan_type}]"
-                )
-            except Exception as e:
-                status_lbl.config(text=f"Error: {e}")
+            self._status.set(
+                f"Loaded {n_loaded} BioXAS .dat scan(s)." +
+                (f"  {len(failures)} file(s) failed." if failures else "")
+            )
 
         btn_row = tk.Frame(win)
         btn_row.pack(pady=(0, 10))
@@ -1121,6 +1603,165 @@ class OrcaTDDFTApp(tk.Tk):
         x = self.winfo_x() + (self.winfo_width()  - win.winfo_width())  // 2
         y = self.winfo_y() + (self.winfo_height() - win.winfo_height()) // 2
         win.geometry(f"+{x}+{y}")
+        return win
+
+    def _load_sxrmb_with_dialog(self, paths):
+        """Preview SXRMB .dat channels, then load selected signal(s)."""
+        return self._open_dat_preview_dialog(
+            paths=paths,
+            loader_kind="sxrmb",
+            title="SXRMB Import - Preview Signals",
+            heading="CLS SXRMB Beamline Import",
+            theme="#003366",
+            sub_fg="#AACCFF",
+            signal_defaults={"tey": True, "fluorescence": True},
+            normalize_default=False,
+            show_normalize=False,
+        )
+
+    def _load_dat_with_dialog(self, paths):
+        """Preview BioXAS .dat channels, then load selected signal(s)."""
+        return self._open_dat_preview_dialog(
+            paths=paths,
+            loader_kind="bioxas",
+            title="BioXAS Import - Preview Signals",
+            heading="BioXAS XDI Import",
+            theme="#6B0000",
+            sub_fg="#ffaaaa",
+            signal_defaults={"fluorescence": True, "transmission": False},
+            normalize_default=True,
+            show_normalize=True,
+        )
+
+    def _open_dat_preview_dialog(self, paths, loader_kind: str, title: str,
+                                 heading: str, theme: str, sub_fg: str,
+                                 signal_defaults: dict,
+                                 normalize_default: bool,
+                                 show_normalize: bool):
+        paths = self._as_path_list(paths)
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.geometry("920x640")
+        win.minsize(780, 540)
+        win.grab_set()
+
+        hdr = tk.Frame(win, bg=theme, padx=12, pady=8)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text=heading, bg=theme, fg="black",
+                 font=("", 11, "bold")).pack(anchor="w")
+        tk.Label(hdr, text=self._format_batch_name(paths), bg=theme,
+                 fg=sub_fg, font=("", 9)).pack(anchor="w")
+
+        body = tk.Frame(win, padx=12, pady=10)
+        body.pack(fill=tk.BOTH, expand=True)
+        left = tk.Frame(body, width=270)
+        left.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
+        right = tk.Frame(body)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        tk.Label(left, text="Preview file", font=("", 9, "bold")).pack(anchor="w")
+        file_list = tk.Listbox(left, height=min(8, max(2, len(paths))),
+                               exportselection=False)
+        file_list.pack(fill=tk.X, pady=(2, 8))
+        for path in paths:
+            file_list.insert(tk.END, os.path.basename(path))
+        file_list.selection_set(0)
+
+        signal_vars = {
+            key: tk.BooleanVar(value=bool(default))
+            for key, default in signal_defaults.items()
+        }
+        ref_var = tk.BooleanVar(value=False)
+        norm_var = tk.BooleanVar(value=normalize_default)
+        imported_refs: list[ExperimentalScan] = []
+        preview_cache = {}
+
+        tk.Label(left, text="Import signals", font=("", 9, "bold")).pack(anchor="w")
+        for key, label in [
+            ("tey", "TEY"),
+            ("fluorescence", "Fluorescence"),
+            ("transmission", "Transmission"),
+        ]:
+            if key in signal_vars:
+                tk.Checkbutton(left, text=label, variable=signal_vars[key],
+                               command=lambda: refresh_preview()).pack(anchor="w")
+
+        if show_normalize:
+            ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+            tk.Checkbutton(left, text="Apply Athena-style normalization",
+                           variable=norm_var).pack(anchor="w")
+
+        ttk.Separator(left, orient=tk.HORIZONTAL).pack(fill=tk.X, pady=8)
+        tk.Label(left, text="Reference", font=("", 9, "bold")).pack(anchor="w")
+
+        fig = Figure(figsize=(6.4, 4.5), dpi=100)
+        ax = fig.add_subplot(111)
+        canvas = FigureCanvasTkAgg(fig, master=right)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        status_lbl = tk.Label(left, text="", fg="#993300", wraplength=250,
+                              justify=tk.LEFT, font=("", 8))
+        status_lbl.pack(anchor="w", fill=tk.X, pady=(8, 0))
+
+        def current_channels():
+            idx = file_list.curselection()
+            path = paths[idx[0] if idx else 0]
+            if path not in preview_cache:
+                preview_cache[path] = self._exp_parser.preview_channels(path)
+            return preview_cache[path]
+
+        def selected_modes():
+            return [key for key, var in signal_vars.items() if var.get()]
+
+        def refresh_preview():
+            channels = current_channels()
+            self._draw_experimental_preview(
+                ax, canvas, channels, set(selected_modes()),
+                show_reference=ref_var.get(), imported_refs=imported_refs,
+            )
+
+        def view_reference():
+            channels = current_channels()
+            has_embedded = any(kind == "reference" for _n, kind, _x, _y in channels)
+            if not has_embedded and not imported_refs:
+                messagebox.showinfo(
+                    "Reference Preview",
+                    "No embedded reference channel was detected for this preview file.\n\n"
+                    "Use Import Reference to add a foil or standard from another scan.",
+                    parent=win,
+                )
+                return
+            ref_var.set(True)
+            refresh_preview()
+
+        def import_reference():
+            refs = self._load_reference_standard_scans()
+            if refs:
+                imported_refs.extend(refs)
+                ref_var.set(True)
+                status_lbl.config(
+                    text=f"Imported {len(imported_refs)} reference/standard scan(s).")
+                refresh_preview()
+
+        tk.Button(left, text="View Reference", width=18,
+                  command=view_reference).pack(anchor="w", pady=(2, 2))
+        tk.Button(left, text="Import Reference...", width=18,
+                  command=import_reference).pack(anchor="w")
+
+        file_list.bind("<<ListboxSelect>>", lambda _e: refresh_preview())
+        refresh_preview()
+
+        btn_row = tk.Frame(win)
+        btn_row.pack(fill=tk.X, padx=12, pady=(0, 10))
+        tk.Button(
+            btn_row, text="Load Selected", width=14, bg=theme, fg="black",
+            activebackground=theme,
+            command=lambda: self._load_selected_experimental_dat(
+                paths, loader_kind, selected_modes(), norm_var.get(),
+                imported_refs, win, status_lbl)
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Button(btn_row, text="Cancel", width=10,
+                  command=win.destroy).pack(side=tk.LEFT, padx=4)
+        return win
 
     def _load_prj_with_dialog(self, path: str):
         """Parse .prj file, then show a scan selection dialog."""
@@ -1141,7 +1782,7 @@ class OrcaTDDFTApp(tk.Tk):
 
         if len(scans) == 1:
             # Only one scan — load it directly
-            self._add_exp_scan_to_plot(scans[0])
+            self._add_experimental_batch([scans[0]])
             self._status.set(f"Loaded 1 scan from {os.path.basename(path)}")
             return
 
@@ -1193,10 +1834,7 @@ class OrcaTDDFTApp(tk.Tk):
                                        parent=win)
                 return
             win.destroy()
-            loaded = 0
-            for idx in sel:
-                self._add_exp_scan_to_plot(scans[idx])
-                loaded += 1
+            loaded = self._add_experimental_batch([scans[idx] for idx in sel])
             self._status.set(
                 f"Loaded {loaded} scan{'s' if loaded != 1 else ''} "
                 f"from {os.path.basename(path)}"

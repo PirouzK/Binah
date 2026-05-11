@@ -69,6 +69,8 @@ module load gaussian/g16.c01
 export GENEXE=`which gennbo.i4.exe`
 export NBOEXE=`which nbo7.i4.exe`
 
+echo "Starting run at: `date`"
+
 $EBROOTORCA/orca {base_name}.inp
 
 echo "Program finished with exit code $? at: `date`"

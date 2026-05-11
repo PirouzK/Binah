@@ -881,6 +881,10 @@ class PlotWidget(tk.Frame):
                   width=10, font=("", 8)).pack(side=tk.RIGHT, padx=2)
         tk.Button(hdr, text="Clear Exp.", command=self._clear_exp_scans,
                   width=9, font=("", 8)).pack(side=tk.RIGHT, padx=2)
+        tk.Button(hdr, text="Hide Refs", command=self._hide_reference_traces,
+                  width=8, font=("", 8)).pack(side=tk.RIGHT, padx=2)
+        tk.Button(hdr, text="Show Refs", command=self._show_reference_traces,
+                  width=8, font=("", 8)).pack(side=tk.RIGHT, padx=2)
         tk.Button(hdr, text="Detach", command=self._unlink_selected_exp_scans,
                   width=7, font=("", 8)).pack(side=tk.RIGHT, padx=2)
         tk.Button(hdr, text="Attach Ref", command=self._link_selected_exp_scans,
@@ -989,6 +993,13 @@ class PlotWidget(tk.Frame):
             meta["_binah_original_e0"] = float(scan.e0)
             meta["_binah_original_norm"] = bool(scan.is_normalized)
             meta["_binah_original_scan_type"] = str(getattr(scan, "scan_type", ""))
+        if scan.has_reference() and "_binah_original_ref_energy" not in meta:
+            ref_energy = scan.ref_energy_ev
+            if ref_energy is None or len(ref_energy) == 0:
+                ref_energy = scan.energy_ev
+            meta["_binah_original_ref_energy"] = np.array(ref_energy, dtype=float).copy()
+            meta["_binah_original_ref_mu"] = np.array(scan.ref_mu, dtype=float).copy()
+            meta["_binah_original_ref_label"] = str(getattr(scan, "ref_label", "") or "")
 
     def _exp_link_meta(self, scan: ExperimentalScan) -> tuple:
         meta = getattr(scan, "metadata", {}) or {}
@@ -1043,12 +1054,111 @@ class PlotWidget(tk.Frame):
                 scans[0].metadata["_binah_link_role"] = "reference"
 
     def _link_display_label(self, label: str, scan: ExperimentalScan) -> str:
+        meta = getattr(scan, "metadata", {}) or {}
+        if meta.get("_binah_reference_trace"):
+            return f"[Ref trace] {label}"
+        if meta.get("reference_role"):
+            return f"[Std] {label}"
+
         _gid, role = self._exp_link_meta(scan)
         if role == "reference":
             return f"[Ref] {label}"
         if role == "linked":
             return f"[Linked] {label}"
+        if scan.has_reference():
+            ref_label = getattr(scan, "ref_label", "") or "reference"
+            return f"{label} [has {ref_label}]"
         return label
+
+    def _reference_trace_key(self, label: str, scan: ExperimentalScan) -> str:
+        source = str(getattr(scan, "source_file", "") or "")
+        ref_label = str(getattr(scan, "ref_label", "") or "reference")
+        return f"{source}|{label}|{ref_label}"
+
+    def _show_reference_traces(self):
+        existing = {
+            str((getattr(sc, "metadata", {}) or {}).get("_binah_reference_source_key", ""))
+            for _lbl, sc, _var, _style in self._exp_scans
+            if (getattr(sc, "metadata", {}) or {}).get("_binah_reference_trace")
+        }
+
+        added = 0
+        for label, scan, _var, _style in list(self._exp_scans):
+            meta = getattr(scan, "metadata", {}) or {}
+            if meta.get("_binah_reference_trace") or not scan.has_reference():
+                continue
+
+            key = self._reference_trace_key(label, scan)
+            if key in existing:
+                continue
+
+            ref_energy = scan.ref_energy_ev
+            if ref_energy is None or len(ref_energy) == 0:
+                ref_energy = scan.energy_ev
+            ref_mu = scan.ref_mu
+            n = min(len(ref_energy), len(ref_mu))
+            if n == 0:
+                continue
+
+            ref_name = str(getattr(scan, "ref_label", "") or "reference")
+            ref_label = f"{label} - {ref_name}"
+            ref_scan = ExperimentalScan(
+                label=ref_label,
+                source_file=getattr(scan, "source_file", ""),
+                energy_ev=np.array(ref_energy[:n], dtype=float).copy(),
+                mu=np.array(ref_mu[:n], dtype=float).copy(),
+                e0=float(getattr(scan, "e0", 0.0) or 0.0),
+                is_normalized=False,
+                scan_type=f"reference channel ({ref_name})",
+                metadata={
+                    "_binah_reference_trace": True,
+                    "_binah_reference_source_key": key,
+                    "_binah_reference_source_label": label,
+                    "reference_role": "visualized reference channel",
+                },
+            )
+            self._ensure_exp_scan_original_backup(ref_scan)
+            var = tk.BooleanVar(value=True)
+            style = _default_exp_style()
+            style.update({
+                "linestyle": "dashed",
+                "linewidth": 1.4,
+                "fill": False,
+                "fill_alpha": 0.0,
+                "color": "#555555",
+            })
+            self._exp_scans.append((ref_label, ref_scan, var, style))
+            existing.add(key)
+            added += 1
+
+        self._refresh_panel_content()
+        self._replot()
+        if added:
+            messagebox.showinfo(
+                "Reference Traces",
+                f"Added {added} embedded reference channel{'s' if added != 1 else ''} to the plot."
+            )
+        else:
+            messagebox.showinfo(
+                "Reference Traces",
+                "No hidden embedded references were found.\n\n"
+                "If you loaded an external foil/standard file, it is already plotted as a normal experimental scan."
+            )
+
+    def _hide_reference_traces(self):
+        before = len(self._exp_scans)
+        self._exp_scans = [
+            entry for entry in self._exp_scans
+            if not ((getattr(entry[1], "metadata", {}) or {}).get("_binah_reference_trace"))
+        ]
+        removed = before - len(self._exp_scans)
+        self._refresh_panel_content()
+        self._replot()
+        if removed:
+            messagebox.showinfo(
+                "Reference Traces",
+                f"Removed {removed} visualized reference trace{'s' if removed != 1 else ''}."
+            )
 
     def _link_selected_exp_scans(self):
         selected = self._selected_exp_entries()

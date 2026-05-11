@@ -385,6 +385,10 @@ class XASAnalysisTab(tk.Frame):
 
         # Scan list panel — BooleanVar per label (visible in overlay)
         self._scan_vis_vars: dict = {}   # label → tk.BooleanVar
+        self._params_frame = None
+        self._params_window = None
+        self._params_floating = False
+        self._params_drag_offset = (0, 0)
 
         self._build_ui()
 
@@ -432,16 +436,17 @@ class XASAnalysisTab(tk.Frame):
         self._status_lbl.pack(side=tk.LEFT, padx=10)
 
         # Main body: params left, scan list centre-left, plot right
-        body = tk.Frame(self)
-        body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        self._body = tk.Frame(self)
+        self._body.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
-        self._build_params(body)
-        self._build_scan_list(body)
-        self._build_plot(body)
+        self._build_params(self._body)
+        self._build_scan_list(self._body)
+        self._build_plot(self._body)
 
     def _build_scan_list(self, parent):
         """Scrollable scan list panel — one row per loaded scan with colour + checkbox."""
         outer = tk.Frame(parent, width=190, bd=1, relief=tk.SUNKEN)
+        self._scan_list_outer = outer
         outer.pack(side=tk.LEFT, fill=tk.Y, padx=(2, 0), pady=2)
         outer.pack_propagate(False)
 
@@ -561,41 +566,100 @@ class XASAnalysisTab(tk.Frame):
         self._selected_labels.clear()
         self._redraw()
 
-    def _build_params(self, parent):
+    def _ensure_param_vars(self):
+        if hasattr(self, "_e0_var"):
+            return
+        nd = _NORM_DEFAULTS
+        self._e0_var = tk.DoubleVar(value=8333.0)
+        self._pre1_var = tk.DoubleVar(value=nd["pre1"])
+        self._pre2_var = tk.DoubleVar(value=nd["pre2"])
+        self._nor1_var = tk.DoubleVar(value=nd["nor1"])
+        self._nor2_var = tk.DoubleVar(value=nd["nor2"])
+        self._nnor_var = tk.IntVar(value=nd["nnorm"])
+        self._rbkg_var = tk.DoubleVar(value=nd["rbkg"])
+        self._kmin_bkg_var = tk.DoubleVar(value=nd["kmin_bkg"])
+        self._kmin_var = tk.DoubleVar(value=nd["kmin"])
+        self._kmax_var = tk.DoubleVar(value=nd["kmax"])
+        self._dk_var = tk.DoubleVar(value=nd["dk"])
+        self._kw_var = tk.IntVar(value=nd["kw"])
+        self._rmax_var = tk.DoubleVar(value=nd["rmax"])
+        self._style_var = tk.StringVar(value="ticks")
+        self._context_var = tk.StringVar(value="paper")
+        self._show_raw_var = tk.BooleanVar(value=True)
+        self._show_preline_var = tk.BooleanVar(value=True)
+        self._show_postline_var = tk.BooleanVar(value=True)
+        self._show_bkg_var = tk.BooleanVar(value=False)
+        self._show_norm_var = tk.BooleanVar(value=True)
+        self._show_deriv_var = tk.BooleanVar(value=False)
+        self._show_win_var = tk.BooleanVar(value=True)
+        self._xanes_xmin_var = tk.StringVar(value="")
+        self._xanes_xmax_var = tk.StringVar(value="")
+        self._xanes_ymin_var = tk.StringVar(value="")
+        self._xanes_ymax_var = tk.StringVar(value="")
+        self._deglitch_sigma_var = tk.DoubleVar(value=6.0)
+        self._deglitch_window_var = tk.IntVar(value=7)
+        self._smooth_window_var = tk.IntVar(value=7)
+        self._smooth_poly_var = tk.IntVar(value=3)
+        self._energy_shift_var = tk.DoubleVar(value=0.0)
+        self._foil_target_e0_var = tk.DoubleVar(value=8333.0)
+
+    def _build_params(self, parent, floating: bool = False):
+        self._ensure_param_vars()
         pf = tk.Frame(parent, width=210, bd=1, relief=tk.SUNKEN, padx=4, pady=4)
-        pf.pack(side=tk.LEFT, fill=tk.Y, padx=(2, 0), pady=2)
+        self._params_frame = pf
+        if floating:
+            pf.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=2, pady=2)
+        else:
+            pack_kw = dict(side=tk.LEFT, fill=tk.Y, padx=(2, 0), pady=2)
+            scan_panel = getattr(self, "_scan_list_outer", None)
+            if scan_panel is not None:
+                try:
+                    if scan_panel.winfo_exists():
+                        pack_kw["before"] = scan_panel
+                except tk.TclError:
+                    pass
+            pf.pack(**pack_kw)
         pf.pack_propagate(False)
 
         def lbl(text):
-            tk.Label(pf, text=text, font=("", 8, "bold"), fg="#333333",
-                     anchor="w").pack(fill=tk.X, pady=(6, 0))
+            widget = tk.Label(pf, text=text, font=("", 8, "bold"), fg="#333333",
+                              anchor="w")
+            widget.pack(fill=tk.X, pady=(6, 0))
+            return widget
 
-        def row(text, var, from_=None, to=None, inc=None, fmt=None, width=7):
+        def row(text, var, from_=None, to=None, inc=None, fmt=None, width=7,
+                on_enter=None):
             f = tk.Frame(pf); f.pack(fill=tk.X, pady=1)
             tk.Label(f, text=text, width=14, anchor="w", font=("", 8)).pack(side=tk.LEFT)
             kw = dict(textvariable=var, width=width, font=("Courier", 8))
             if from_ is not None:
                 kw.update(from_=from_, to=to, increment=inc, format=fmt or "%.2f")
-                ttk.Spinbox(f, **kw).pack(side=tk.LEFT)
+                widget = ttk.Spinbox(f, **kw)
             else:
-                ttk.Entry(f, **kw).pack(side=tk.LEFT)
+                widget = ttk.Entry(f, **kw)
+            widget.pack(side=tk.LEFT)
+            if on_enter is not None:
+                widget.bind("<Return>", on_enter)
+                widget.bind("<KP_Enter>", on_enter)
+            return widget
 
         # ── Edge / Normalization ──────────────────────────────────────────
-        lbl("\u2500\u2500 Edge / Normalization \u2500\u2500\u2500\u2500\u2500")
+        edge_hdr = lbl("\u2500\u2500 Edge / Normalization \u2500\u2500\u2500\u2500\u2500")
+        self._make_params_drag_handle(edge_hdr)
         nd = _NORM_DEFAULTS   # shorthand
-        self._e0_var    = tk.DoubleVar(value=8333.0)
-        self._pre1_var  = tk.DoubleVar(value=nd["pre1"])
-        self._pre2_var  = tk.DoubleVar(value=nd["pre2"])
-        self._nor1_var  = tk.DoubleVar(value=nd["nor1"])
-        self._nor2_var  = tk.DoubleVar(value=nd["nor2"])
-        self._nnor_var  = tk.IntVar(value=nd["nnorm"])
 
         # E0 range covers both L-edges (~100 eV) and heavy-atom K-edges (>30 keV)
-        row("E0 (eV):",    self._e0_var,   100, 40000, 0.5,  "%.1f")
-        row("pre1 (eV):",  self._pre1_var, -300,  -1,   5.0,  "%.0f")
-        row("pre2 (eV):",  self._pre2_var, -200,  -1,   5.0,  "%.0f")
-        row("nor1 (eV):",  self._nor1_var,    1,  500,   5.0, "%.0f")
-        row("nor2 (eV):",  self._nor2_var,    1, 1000,   5.0, "%.0f")
+        run_on_enter = self._run_from_entry_event
+        row("E0 (eV):",    self._e0_var,   100, 40000, 0.5,  "%.1f",
+            on_enter=run_on_enter)
+        row("pre1 (eV):",  self._pre1_var, -300,  -1,   5.0,  "%.0f",
+            on_enter=run_on_enter)
+        row("pre2 (eV):",  self._pre2_var, -200,  -1,   5.0,  "%.0f",
+            on_enter=run_on_enter)
+        row("nor1 (eV):",  self._nor1_var,    1,  500,   5.0, "%.0f",
+            on_enter=run_on_enter)
+        row("nor2 (eV):",  self._nor2_var,    1, 1000,   5.0, "%.0f",
+            on_enter=run_on_enter)
 
         # Edge-type indicator — updated dynamically in _auto_fill_e0()
         self._edge_type_lbl = tk.Label(
@@ -617,23 +681,21 @@ class XASAnalysisTab(tk.Frame):
 
         # ── AUTOBK ── K-edge only ─────────────────────────────────────────
         lbl("\u2500\u2500 AUTOBK \u2014 K-edge only \u2500\u2500\u2500\u2500")
-        self._rbkg_var     = tk.DoubleVar(value=nd["rbkg"])
-        self._kmin_bkg_var = tk.DoubleVar(value=nd["kmin_bkg"])
-        row("rbkg (A):",   self._rbkg_var,   0.3, 3.0, 0.1, "%.1f")
-        row("kmin_bkg:",   self._kmin_bkg_var, 0, 5.0, 0.5, "%.1f")
+        row("rbkg (A):",   self._rbkg_var,   0.3, 3.0, 0.1, "%.1f",
+            on_enter=run_on_enter)
+        row("kmin_bkg:",   self._kmin_bkg_var, 0, 5.0, 0.5, "%.1f",
+            on_enter=run_on_enter)
 
         # ── XFTF ── K-edge only ───────────────────────────────────────────
         lbl("\u2500\u2500 FT \u2014 K-edge only \u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-        self._kmin_var   = tk.DoubleVar(value=nd["kmin"])
-        self._kmax_var   = tk.DoubleVar(value=nd["kmax"])
-        self._dk_var     = tk.DoubleVar(value=nd["dk"])
-        self._kw_var     = tk.IntVar(value=nd["kw"])
-        self._rmax_var   = tk.DoubleVar(value=nd["rmax"])
-
-        row("kmin (A^-1):", self._kmin_var, 0,  6,   0.5, "%.1f")
-        row("kmax (A^-1):", self._kmax_var, 4,  20,  0.5, "%.1f")
-        row("dk (A^-1):",   self._dk_var,   0.1, 3,  0.1, "%.1f")
-        row("R max (A):",   self._rmax_var, 2,  12,  0.5, "%.1f")
+        row("kmin (A^-1):", self._kmin_var, 0,  6,   0.5, "%.1f",
+            on_enter=run_on_enter)
+        row("kmax (A^-1):", self._kmax_var, 4,  20,  0.5, "%.1f",
+            on_enter=run_on_enter)
+        row("dk (A^-1):",   self._dk_var,   0.1, 3,  0.1, "%.1f",
+            on_enter=run_on_enter)
+        row("R max (A):",   self._rmax_var, 2,  12,  0.5, "%.1f",
+            on_enter=run_on_enter)
 
         f_kw = tk.Frame(pf); f_kw.pack(fill=tk.X, pady=1)
         tk.Label(f_kw, text="k-weight:", width=14, anchor="w",
@@ -644,8 +706,6 @@ class XASAnalysisTab(tk.Frame):
 
         # ── Plot style ────────────────────────────────────────────────────
         lbl("\u2500\u2500 Plot Style \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-        self._style_var = tk.StringVar(value="ticks")
-        self._context_var = tk.StringVar(value="paper")
         f_sty = tk.Frame(pf); f_sty.pack(fill=tk.X, pady=1)
         tk.Label(f_sty, text="Style:", width=14, anchor="w",
                  font=("", 8)).pack(side=tk.LEFT)
@@ -671,14 +731,6 @@ class XASAnalysisTab(tk.Frame):
                      anchor="w").pack(fill=tk.X, pady=(6, 0))
 
         _slbl("── Show on XANES plot ───────")
-        self._show_raw_var      = tk.BooleanVar(value=True)
-        self._show_preline_var  = tk.BooleanVar(value=True)
-        self._show_postline_var = tk.BooleanVar(value=True)
-        self._show_bkg_var      = tk.BooleanVar(value=False)
-        self._show_norm_var     = tk.BooleanVar(value=True)
-        self._show_deriv_var    = tk.BooleanVar(value=False)
-        self._show_win_var      = tk.BooleanVar(value=True)
-
         for _txt, _var in [
             ("\u03bc(E)  raw",         self._show_raw_var),
             ("Pre-edge fit",           self._show_preline_var),
@@ -692,34 +744,41 @@ class XASAnalysisTab(tk.Frame):
                            font=("", 8)).pack(anchor="w", pady=1)
 
         lbl("\u2500\u2500 View Box \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-        self._xanes_xmin_var = tk.StringVar(value="")
-        self._xanes_xmax_var = tk.StringVar(value="")
-        self._xanes_ymin_var = tk.StringVar(value="")
-        self._xanes_ymax_var = tk.StringVar(value="")
-
         f_vx1 = tk.Frame(pf); f_vx1.pack(fill=tk.X, pady=1)
         tk.Label(f_vx1, text="X min:", width=14, anchor="w",
                  font=("", 8)).pack(side=tk.LEFT)
-        ttk.Entry(f_vx1, textvariable=self._xanes_xmin_var,
-                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+        ent = ttk.Entry(f_vx1, textvariable=self._xanes_xmin_var,
+                        width=9, font=("Courier", 8))
+        ent.pack(side=tk.LEFT)
+        ent.bind("<Return>", self._apply_xanes_view_box_from_event)
+        ent.bind("<KP_Enter>", self._apply_xanes_view_box_from_event)
 
         f_vx2 = tk.Frame(pf); f_vx2.pack(fill=tk.X, pady=1)
         tk.Label(f_vx2, text="X max:", width=14, anchor="w",
                  font=("", 8)).pack(side=tk.LEFT)
-        ttk.Entry(f_vx2, textvariable=self._xanes_xmax_var,
-                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+        ent = ttk.Entry(f_vx2, textvariable=self._xanes_xmax_var,
+                        width=9, font=("Courier", 8))
+        ent.pack(side=tk.LEFT)
+        ent.bind("<Return>", self._apply_xanes_view_box_from_event)
+        ent.bind("<KP_Enter>", self._apply_xanes_view_box_from_event)
 
         f_vy1 = tk.Frame(pf); f_vy1.pack(fill=tk.X, pady=1)
         tk.Label(f_vy1, text="Y min:", width=14, anchor="w",
                  font=("", 8)).pack(side=tk.LEFT)
-        ttk.Entry(f_vy1, textvariable=self._xanes_ymin_var,
-                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+        ent = ttk.Entry(f_vy1, textvariable=self._xanes_ymin_var,
+                        width=9, font=("Courier", 8))
+        ent.pack(side=tk.LEFT)
+        ent.bind("<Return>", self._apply_xanes_view_box_from_event)
+        ent.bind("<KP_Enter>", self._apply_xanes_view_box_from_event)
 
         f_vy2 = tk.Frame(pf); f_vy2.pack(fill=tk.X, pady=1)
         tk.Label(f_vy2, text="Y max:", width=14, anchor="w",
                  font=("", 8)).pack(side=tk.LEFT)
-        ttk.Entry(f_vy2, textvariable=self._xanes_ymax_var,
-                  width=9, font=("Courier", 8)).pack(side=tk.LEFT)
+        ent = ttk.Entry(f_vy2, textvariable=self._xanes_ymax_var,
+                        width=9, font=("Courier", 8))
+        ent.pack(side=tk.LEFT)
+        ent.bind("<Return>", self._apply_xanes_view_box_from_event)
+        ent.bind("<KP_Enter>", self._apply_xanes_view_box_from_event)
 
         f_vbtn = tk.Frame(pf); f_vbtn.pack(fill=tk.X, pady=(2, 1))
         tk.Button(f_vbtn, text="Apply", font=("", 8),
@@ -730,8 +789,6 @@ class XASAnalysisTab(tk.Frame):
                   command=self._reset_xanes_view_box).pack(side=tk.LEFT)
 
         lbl("\u2500\u2500 Processing \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500")
-        self._deglitch_sigma_var = tk.DoubleVar(value=6.0)
-        self._deglitch_window_var = tk.IntVar(value=7)
         row("Glitch \u03c3:", self._deglitch_sigma_var, 2.0, 15.0, 0.5, "%.1f")
         row("Median pts:", self._deglitch_window_var, 3, 31, 2, "%.0f")
         f_deg = tk.Frame(pf); f_deg.pack(fill=tk.X, pady=(2, 1))
@@ -740,23 +797,89 @@ class XASAnalysisTab(tk.Frame):
         tk.Button(f_deg, text="Reset Scan", font=("", 8),
                   command=self._reset_current_scan_processing).pack(side=tk.LEFT, padx=4)
 
-        self._smooth_window_var = tk.IntVar(value=7)
-        self._smooth_poly_var = tk.IntVar(value=3)
         row("Smooth pts:", self._smooth_window_var, 5, 51, 2, "%.0f")
         row("Poly order:", self._smooth_poly_var, 2, 5, 1, "%.0f")
         f_smooth = tk.Frame(pf); f_smooth.pack(fill=tk.X, pady=(2, 1))
         tk.Button(f_smooth, text="Smooth Scan", font=("", 8),
                   command=self._smooth_current_scan).pack(side=tk.LEFT)
 
-        self._energy_shift_var = tk.DoubleVar(value=0.0)
         row("Shift E (eV):", self._energy_shift_var, -20.0, 20.0, 0.1, "%.1f")
+        row("Foil E0 (eV):", self._foil_target_e0_var, 100, 40000, 0.5, "%.1f")
         f_shift = tk.Frame(pf); f_shift.pack(fill=tk.X, pady=(2, 1))
         tk.Button(f_shift, text="Shift Energy", font=("", 8),
                   command=self._shift_current_scan_energy).pack(side=tk.LEFT)
+        tk.Button(f_shift, text="Calibrate to Foil", font=("", 8),
+                  command=self._calibrate_current_scan_to_foil).pack(
+                      side=tk.LEFT, padx=4)
 
         tk.Checkbutton(pf, text="Show FT window on \u03c7(k)",
                        variable=self._show_win_var,
                        font=("", 8)).pack(anchor="w", pady=1)
+
+    def _make_params_drag_handle(self, widget):
+        widget.config(cursor="fleur")
+        widget.bind("<Double-Button-1>", self._toggle_params_float)
+        widget.bind("<ButtonPress-1>", self._start_params_drag)
+        widget.bind("<B1-Motion>", self._drag_params_window)
+
+    def _toggle_params_float(self, _event=None):
+        if self._params_floating:
+            self._dock_params_panel()
+        else:
+            self._float_params_panel()
+        return "break"
+
+    def _float_params_panel(self):
+        if self._params_floating:
+            return
+        try:
+            root_x = self.winfo_toplevel().winfo_rootx()
+            root_y = self.winfo_toplevel().winfo_rooty()
+        except tk.TclError:
+            root_x = root_y = 80
+        if self._params_frame is not None:
+            self._params_frame.destroy()
+        win = tk.Toplevel(self)
+        self._params_window = win
+        self._params_floating = True
+        win.title("XAS Controls")
+        win.geometry(f"225x760+{root_x + 40}+{root_y + 70}")
+        win.minsize(225, 420)
+        win.protocol("WM_DELETE_WINDOW", self._dock_params_panel)
+        self._build_params(win, floating=True)
+
+    def _dock_params_panel(self):
+        if self._params_frame is not None:
+            try:
+                self._params_frame.destroy()
+            except tk.TclError:
+                pass
+        win = self._params_window
+        self._params_window = None
+        self._params_floating = False
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+        self._build_params(self._body)
+        self._redraw()
+
+    def _start_params_drag(self, event):
+        if not self._params_floating or self._params_window is None:
+            return
+        self._params_drag_offset = (
+            event.x_root - self._params_window.winfo_x(),
+            event.y_root - self._params_window.winfo_y(),
+        )
+
+    def _drag_params_window(self, event):
+        if not self._params_floating or self._params_window is None:
+            return
+        dx, dy = self._params_drag_offset
+        x = event.x_root - dx
+        y = event.y_root - dy
+        self._params_window.geometry(f"+{x}+{y}")
 
     def _update_show_section_visibility(self):
         """Keep the XANES display toggles visible.
@@ -804,6 +927,14 @@ class XASAnalysisTab(tk.Frame):
         self._redraw_xanes()
         self._status_lbl.config(text="Applied XANES view box.", fg="#003366")
 
+    def _apply_xanes_view_box_from_event(self, _event=None):
+        self._apply_xanes_view_box()
+        return "break"
+
+    def _run_from_entry_event(self, _event=None):
+        self._run()
+        return "break"
+
     def _capture_xanes_view_box(self):
         xmin, xmax = self._ax_mu.get_xlim()
         ymin, ymax = self._ax_mu.get_ylim()
@@ -833,6 +964,10 @@ class XASAnalysisTab(tk.Frame):
             meta["_binah_original_mu"] = scan.mu.copy()
             meta["_binah_original_e0"] = float(scan.e0)
             meta["_binah_original_norm"] = bool(scan.is_normalized)
+            if getattr(scan, "ref_energy_ev", None) is not None:
+                meta["_binah_original_ref_energy"] = scan.ref_energy_ev.copy()
+            if getattr(scan, "ref_mu", None) is not None:
+                meta["_binah_original_ref_mu"] = scan.ref_mu.copy()
 
     def _restore_scan_backup(self, scan) -> bool:
         self._ensure_scan_backup(scan)
@@ -843,6 +978,11 @@ class XASAnalysisTab(tk.Frame):
         scan.mu = np.array(meta["_binah_original_mu"], dtype=float).copy()
         scan.e0 = float(meta.get("_binah_original_e0", 0.0))
         scan.is_normalized = bool(meta.get("_binah_original_norm", scan.is_normalized))
+        if "_binah_original_ref_energy" in meta:
+            scan.ref_energy_ev = np.array(
+                meta["_binah_original_ref_energy"], dtype=float).copy()
+        if "_binah_original_ref_mu" in meta:
+            scan.ref_mu = np.array(meta["_binah_original_ref_mu"], dtype=float).copy()
         return True
 
     def _odd_int(self, value, minimum: int = 3) -> int:
@@ -982,6 +1122,33 @@ class XASAnalysisTab(tk.Frame):
             text=f"Smoothed {label} with Savitzky-Golay ({window} pts, poly {poly}).",
             fg="#003366")
 
+    def _linked_scans_for_energy_shift(self, label, scan):
+        meta = getattr(scan, "metadata", {}) or {}
+        link_group = meta.get("_binah_link_group")
+        linked_scans = []
+        if link_group:
+            for other_label, other_scan, *_ in self._get_scans():
+                other_meta = getattr(other_scan, "metadata", {}) or {}
+                if other_meta.get("_binah_link_group") == link_group:
+                    linked_scans.append((other_label, other_scan))
+        else:
+            linked_scans.append((label, scan))
+        return linked_scans
+
+    def _apply_energy_shift_to_linked_scans(self, label, scan, shift: float) -> int:
+        linked_scans = self._linked_scans_for_energy_shift(label, scan)
+
+        moved = 0
+        for _lbl, _scan in linked_scans:
+            self._ensure_scan_backup(_scan)
+            _scan.energy_ev = _scan.energy_ev + shift
+            if getattr(_scan, "ref_energy_ev", None) is not None:
+                _scan.ref_energy_ev = _scan.ref_energy_ev + shift
+            if _scan.e0:
+                _scan.e0 = float(_scan.e0 + shift)
+            moved += 1
+        return moved
+
     def _shift_current_scan_energy(self):
         label, scan = self._get_current_scan()
         if scan is None:
@@ -993,23 +1160,7 @@ class XASAnalysisTab(tk.Frame):
                                     fg="gray")
             return
 
-        meta = getattr(scan, "metadata", {}) or {}
-        link_group = meta.get("_binah_link_group")
-        linked_scans = []
-        if link_group:
-            for other_label, other_scan, *_ in self._get_scans():
-                other_meta = getattr(other_scan, "metadata", {}) or {}
-                if other_meta.get("_binah_link_group") == link_group:
-                    linked_scans.append((other_label, other_scan))
-        else:
-            linked_scans.append((label, scan))
-
-        moved = 0
-        for _lbl, _scan in linked_scans:
-            _scan.energy_ev = _scan.energy_ev + shift
-            if _scan.e0:
-                _scan.e0 = float(_scan.e0 + shift)
-            moved += 1
+        moved = self._apply_energy_shift_to_linked_scans(label, scan, shift)
 
         self._refresh_after_processing_change(label)
         if moved > 1:
@@ -1020,6 +1171,44 @@ class XASAnalysisTab(tk.Frame):
             self._status_lbl.config(
                 text=f"Shifted {label} by {shift:.2f} eV.",
                 fg="#003366")
+
+    def _calibrate_current_scan_to_foil(self):
+        label, scan = self._get_current_scan()
+        if scan is None:
+            return
+
+        if len(scan.energy_ev) < 4 or len(scan.mu) < 4:
+            self._status_lbl.config(text="Not enough foil points to find E0.",
+                                    fg="#993300")
+            return
+
+        target_e0 = float(self._foil_target_e0_var.get())
+        measured_e0 = find_e0(scan.energy_ev, scan.mu)
+        shift = target_e0 - measured_e0
+        self._energy_shift_var.set(round(shift, 3))
+
+        if abs(shift) < 1e-12:
+            self._status_lbl.config(
+                text=f"{label} is already calibrated to {target_e0:.2f} eV.",
+                fg="gray")
+            return
+
+        moved = self._apply_energy_shift_to_linked_scans(label, scan, shift)
+        scan.metadata["foil_calibration"] = {
+            "target_e0_ev": round(target_e0, 6),
+            "measured_e0_ev": round(measured_e0, 6),
+            "shift_ev": round(shift, 6),
+        }
+
+        self._refresh_after_processing_change(label)
+        if moved > 1:
+            text = (f"Calibrated {label} and {moved - 1} linked scan(s): "
+                    f"foil E0 {measured_e0:.2f} -> {target_e0:.2f} eV "
+                    f"({shift:+.2f} eV).")
+        else:
+            text = (f"Calibrated {label}: foil E0 {measured_e0:.2f} -> "
+                    f"{target_e0:.2f} eV ({shift:+.2f} eV).")
+        self._status_lbl.config(text=text, fg="#003366")
 
     def _reset_current_scan_processing(self):
         label, scan = self._get_current_scan()
